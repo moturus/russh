@@ -798,6 +798,7 @@ impl Session {
                     sender_maximum_packet_size: self.common.config.maximum_packet_size,
                     sender_window_size_max: self.common.config.window_size,
                     sender_window_exceeded: 0,
+                    application_consumed: None,
                     confirmed: true,
                     wants_reply: false,
                     pending_data: std::collections::VecDeque::new(),

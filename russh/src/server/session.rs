@@ -13,7 +13,7 @@ use super::*;
 use crate::channels::{Channel, ChannelMsg, ChannelReadHalf, ChannelRef, ChannelWriteHalf};
 use crate::helpers::NameList;
 use crate::kex::{EXTENSION_SUPPORT_AS_CLIENT, KexCause, SessionKexState};
-use crate::{ChannelOpenFailure, map_err, msg};
+use crate::{ChannelOpenFailure, ReceiveCredit, map_err, msg};
 
 /// A connected server session. This type is unique to a client.
 #[derive(Debug)]
@@ -22,6 +22,8 @@ pub struct Session {
     pub(crate) sender: Handle,
     pub(crate) priority_receiver: UnboundedReceiver<Msg>,
     pub(crate) receiver: Receiver<Msg>,
+    pub(crate) receive_credit_sender: tokio::sync::mpsc::UnboundedSender<ChannelId>,
+    pub(crate) receive_credit_receiver: tokio::sync::mpsc::UnboundedReceiver<ChannelId>,
     pub(crate) target_window_size: u32,
     pub(crate) pending_reads: Vec<Vec<u8>>,
     pub(crate) pending_len: u32,
@@ -628,6 +630,25 @@ impl Session {
         Ok(())
     }
 
+    /// Put an established channel's receive window under application control.
+    ///
+    /// Russh then returns window credit only after the application reports
+    /// consuming bytes through the returned handle. Repeated calls share the
+    /// same accounting state. Dropping every handle restores automatic mode.
+    pub fn receive_credit(&mut self, channel: ChannelId) -> Option<ReceiveCredit> {
+        let params = self.common.encrypted.as_mut()?.channels.get_mut(&channel)?;
+        Some(ReceiveCredit::new(params.application_receive_credit(
+            self.receive_credit_sender.clone(),
+        )))
+    }
+
+    fn flush_receive_credit(&mut self, channel: ChannelId) -> Result<bool, Error> {
+        match self.common.encrypted.as_mut() {
+            Some(enc) => enc.flush_receive_credit(channel, self.target_window_size),
+            None => Ok(false),
+        }
+    }
+
     pub(crate) async fn run<H, R>(
         mut self,
         mut stream: SshRead<R>,
@@ -782,6 +803,11 @@ impl Session {
                         None => {
                             debug!("self.receiver: received None");
                         }
+                    }
+                }
+                channel = self.receive_credit_receiver.recv(), if !self.kex.active() => {
+                    if let Some(channel) = channel {
+                        self.flush_receive_credit(channel)?;
                     }
                 }
             }
@@ -1526,6 +1552,8 @@ mod tests {
             sender,
             channel_buffer_size: config.channel_buffer_size,
         };
+        let (receive_credit_sender, receive_credit_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         Session {
             common: CommonSession {
@@ -1566,6 +1594,8 @@ mod tests {
             sender: handle,
             priority_receiver,
             receiver,
+            receive_credit_sender,
+            receive_credit_receiver,
             target_window_size: config.window_size,
             pending_reads: Vec::new(),
             pending_len: 0,
@@ -1573,6 +1603,85 @@ mod tests {
             open_global_requests: VecDeque::new(),
             kex: SessionKexState::Idle,
         }
+    }
+
+    fn manual_window_channel(session: &mut Session) -> (ChannelId, ReceiveCredit) {
+        session.target_window_size = 1024;
+        let encrypted = session.common.encrypted.as_mut().unwrap();
+        let channel = encrypted.new_channel(1024, 128);
+        let params = encrypted.channels.get_mut(&channel).unwrap();
+        params.recipient_channel = 17;
+        params.confirmed = true;
+        let credit = session.receive_credit(channel).unwrap();
+        (channel, credit)
+    }
+
+    fn receive(session: &mut Session, channel: ChannelId, len: usize) {
+        let encrypted = session.common.encrypted.as_mut().unwrap();
+        let mut remaining = len;
+        while remaining != 0 {
+            let packet = remaining.min(128);
+            assert_eq!(
+                encrypted.consume_receive_window(channel, packet, false),
+                crate::session::ReceiveWindowState::Accepted
+            );
+            remaining -= packet;
+        }
+        assert!(!encrypted
+            .refill_receive_window(channel, session.target_window_size)
+            .unwrap());
+    }
+
+    #[test]
+    fn manual_window_refills_only_reported_consumption() {
+        let mut session = authenticated_session();
+        let (channel, credit) = manual_window_channel(&mut session);
+        receive(&mut session, channel, 512);
+
+        credit.consumed(256);
+        assert!(session.flush_receive_credit(channel).unwrap());
+        assert_eq!(
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .sender_window_size(channel),
+            768
+        );
+    }
+
+    #[test]
+    fn receive_credit_clamps_application_overreporting() {
+        let mut session = authenticated_session();
+        let (channel, credit) = manual_window_channel(&mut session);
+        receive(&mut session, channel, 1024);
+
+        credit.consumed(4096);
+        assert!(session.flush_receive_credit(channel).unwrap());
+        assert_eq!(
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .sender_window_size(channel),
+            1024
+        );
+    }
+
+    #[test]
+    fn dropping_last_credit_restores_an_exhausted_window() {
+        let mut session = authenticated_session();
+        let (channel, credit) = manual_window_channel(&mut session);
+        receive(&mut session, channel, 1024);
+
+        drop(credit);
+        assert_eq!(session.receive_credit_receiver.try_recv(), Ok(channel));
+        assert!(session.flush_receive_credit(channel).unwrap());
+        let encrypted = session.common.encrypted.as_ref().unwrap();
+        assert_eq!(encrypted.sender_window_size(channel), 1024);
+        assert!(encrypted.channels[&channel].application_consumed.is_none());
     }
 
     fn compressed_debug_payload(payload_len: usize) -> Vec<u8> {
