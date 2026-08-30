@@ -192,7 +192,7 @@ impl russh::server::Handler for Server {
         let mut rx = self.rx.take().unwrap();
         reply.accept().await;
         tokio::spawn(async move {
-            while let Ok(_) = rx.changed().await {
+            while rx.changed().await.is_ok() {
                 match channel.wait().await {
                     Some(ChannelMsg::Data { .. }) => (),
                     Some(ChannelMsg::Close) | None => break,
