@@ -1695,8 +1695,11 @@ impl Session {
                         pending.window_size.encode(&mut enc.write)?;
                         pending.packet_size.encode(&mut enc.write)?;
                     });
+                    let Some(channel_params) = pending.channel_params else {
+                        return Err(crate::Error::Inconsistent);
+                    };
                     enc.channels
-                        .insert(pending.sender_channel, pending.channel_params);
+                        .insert(pending.sender_channel, channel_params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
                 }

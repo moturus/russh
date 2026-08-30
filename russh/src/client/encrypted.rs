@@ -820,7 +820,7 @@ impl Session {
                     window_size: self.common.config.window_size,
                     packet_size: self.common.config.maximum_packet_size,
                     channel_ref,
-                    channel_params,
+                    channel_params: Some(channel_params),
                 };
                 let reply = ChannelOpenHandle::new(
                     self.priority_sender.clone(),

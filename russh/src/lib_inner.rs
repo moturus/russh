@@ -666,7 +666,7 @@ pub struct PendingChannelOpen {
     pub(crate) window_size: u32,
     pub(crate) packet_size: u32,
     pub(crate) channel_ref: channels::ChannelRef,
-    pub(crate) channel_params: ChannelParams,
+    pub(crate) channel_params: Option<ChannelParams>,
 }
 
 /// A handle passed to channel-open callbacks that the handler uses to
