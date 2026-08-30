@@ -502,6 +502,10 @@ pub(crate) struct ChannelParams {
     sender_window_size: u32,
     recipient_maximum_packet_size: u32,
     sender_maximum_packet_size: u32,
+    /// Largest receive window advertised for this channel.
+    sender_window_size_max: u32,
+    /// Bytes received beyond the window extended to the peer.
+    sender_window_exceeded: u32,
     /// Has the other side confirmed the channel?
     pub confirmed: bool,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]

@@ -1221,10 +1221,22 @@ impl Session {
                 trace!("handler.data {ext:?} {channel_num:?}");
                 let data = map_err!(Bytes::decode(r))?;
                 map_err!(ensure_end(r))?;
-                let target = self.target_window_size;
-
                 if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
+                    match enc.consume_receive_window(channel_num, data.len(), ext.is_some()) {
+                        ReceiveWindowState::Accepted => {}
+                        ReceiveWindowState::Discarded => return Ok(()),
+                        ReceiveWindowState::ProtocolError => {
+                            self.common.disconnect(
+                                crate::Disconnect::ProtocolError,
+                                "invalid channel data window",
+                                "",
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                }
+                if let Some(ref mut enc) = self.common.encrypted {
+                    if enc.refill_receive_window(channel_num, self.target_window_size)? {
                         let window = handler.adjust_window(channel_num, self.target_window_size);
                         if window > 0 {
                             self.target_window_size = window
@@ -1778,6 +1790,8 @@ impl Session {
             sender_window_size: self.common.config.window_size,
             recipient_maximum_packet_size: msg.recipient_maximum_packet_size,
             sender_maximum_packet_size: self.common.config.maximum_packet_size,
+            sender_window_size_max: self.common.config.window_size,
+            sender_window_exceeded: 0,
             confirmed: true,
             wants_reply: false,
             pending_data: std::collections::VecDeque::new(),
