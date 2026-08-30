@@ -651,6 +651,7 @@ mod tests {
             receiver,
             receive_credit_sender,
             receive_credit_receiver,
+            pending_channel_data: None,
             sender: handle,
             pending_reads: Vec::new(),
             pending_len: 0,
@@ -1239,32 +1240,33 @@ impl Session {
                         }
                     }
                 }
-                if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.refill_receive_window(channel_num, self.target_window_size)? {
-                        let window = handler.adjust_window(channel_num, self.target_window_size);
-                        if window > 0 {
-                            self.target_window_size = window
+                let message = match ext {
+                    Some(ext) => ChannelMsg::ExtendedData {
+                        ext,
+                        data: data.clone(),
+                    },
+                    None => ChannelMsg::Data { data: data.clone() },
+                };
+                if let Some(chan) = self.channels.get(&channel_num) {
+                    match chan.try_send(message) {
+                        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            let sender = std::ops::Deref::deref(chan).clone();
+                            self.pending_channel_data = Some(PendingChannelData::new(
+                                channel_num,
+                                data,
+                                ext,
+                                sender,
+                            ));
+                            return Ok(());
                         }
                     }
-                    enc.flush_receive_credit(channel_num, self.target_window_size)?;
                 }
+                self.replenish_receive_window(handler, channel_num)?;
                 self.flush()?;
                 if let Some(ext) = ext {
-                    if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::ExtendedData {
-                            ext,
-                            data: data.clone(),
-                        })
-                        .await
-                        .unwrap_or(())
-                    }
                     handler.extended_data(channel_num, ext, &data, self).await
                 } else {
-                    if let Some(chan) = self.channels.get(&channel_num) {
-                        chan.send(ChannelMsg::Data { data: data.clone() })
-                            .await
-                            .unwrap_or(())
-                    }
                     handler.data(channel_num, &data, self).await
                 }
             }
