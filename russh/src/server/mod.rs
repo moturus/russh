@@ -37,7 +37,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use client::GexParams;
-use futures::future::Future;
+use futures::future::{AbortHandle, Abortable, Future};
 use log::{debug, error, info, warn};
 use msg::{is_kex_msg, validate_client_msg_strict_kex};
 use russh_util::runtime::JoinHandle;
@@ -1066,12 +1066,22 @@ async fn start_reading<R: AsyncRead + Unpin>(
 pub struct RunningSession<H: Handler> {
     handle: Handle,
     join: JoinHandle<Result<(), H::Error>>,
+    abort: AbortHandle,
 }
 
 impl<H: Handler> RunningSession<H> {
     /// Returns a new handle for the session.
     pub fn handle(&self) -> Handle {
         self.handle.clone()
+    }
+
+    /// Abort the session task, including any pending handler callback.
+    ///
+    /// Await the session to wait for its handler and transport to be dropped.
+    /// An observed abort completes with [`Error::Disconnect`]. Blocking work
+    /// independently spawned by a handler is not cancelled.
+    pub fn abort(&self) {
+        self.abort.abort();
     }
 }
 
@@ -1134,9 +1144,19 @@ where
 
     session.begin_rekey()?;
 
-    let join = russh_util::runtime::spawn(session.run(stream, handler));
+    let (abort, registration) = AbortHandle::new_pair();
+    let join = russh_util::runtime::spawn(async move {
+        match Abortable::new(session.run(stream, handler), registration).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Disconnect.into()),
+        }
+    });
 
-    Ok(RunningSession { handle, join })
+    Ok(RunningSession {
+        handle,
+        join,
+        abort,
+    })
 }
 
 async fn read_ssh_id<R: AsyncRead + Unpin>(
