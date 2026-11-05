@@ -1293,6 +1293,15 @@ impl Session {
 
     /// Close a channel.
     pub fn close(&mut self, channel: ChannelId) -> Result<(), Error> {
+        self.channels.remove(&channel);
+        // A pending delivery also owns a sender that would keep the queue alive.
+        if self
+            .pending_channel_data
+            .as_ref()
+            .is_some_and(|p| p.channel == channel)
+        {
+            self.pending_channel_data = None;
+        }
         if let Some(ref mut enc) = self.common.encrypted {
             enc.close(channel)
         } else {
@@ -1727,6 +1736,7 @@ mod tests {
     use std::num::Wrapping;
     use std::sync::Arc;
 
+    use futures::FutureExt;
     use ssh_encoding::Encode;
 
     use super::*;
@@ -1835,19 +1845,16 @@ mod tests {
         (channel, credit)
     }
 
-    fn close_test_channel(
-        session: &mut Session,
-        confirmed: bool,
-    ) -> (ChannelId, tokio::sync::mpsc::Receiver<ChannelMsg>) {
+    fn close_test_channel(session: &mut Session, confirmed: bool) -> (ChannelId, Channel<Msg>) {
         let enc = session.common.encrypted.as_mut().unwrap();
         let id = enc.new_channel(1024, 128);
         let params = enc.channels.get_mut(&id).unwrap();
         params.recipient_channel = 42;
         params.recipient_maximum_packet_size = 128;
         params.confirmed = confirmed;
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        session.channels.insert(id, ChannelRef::new(sender));
-        (id, receiver)
+        let (channel, reference) = Channel::new(id, session.sender.sender.clone(), 128, 0, 8);
+        session.channels.insert(id, reference);
+        (id, channel)
     }
 
     #[tokio::test]
@@ -1884,10 +1891,10 @@ mod tests {
         assert!(!session.channels.contains_key(&id));
         assert_eq!(enc.write[4], msg::CHANNEL_CLOSE);
         assert!(
-            matches!(received.recv().await, Some(ChannelMsg::Data { data }) if data.as_ref() == b"received")
+            matches!(received.wait().await, Some(ChannelMsg::Data { data }) if data.as_ref() == b"received")
         );
-        assert!(matches!(received.recv().await, Some(ChannelMsg::Close)));
-        assert!(received.recv().await.is_none());
+        assert!(matches!(received.wait().await, Some(ChannelMsg::Close)));
+        assert!(received.wait().await.is_none());
 
         let written = enc.write.clone();
         session
@@ -1912,10 +1919,114 @@ mod tests {
         let enc = session.common.encrypted.as_ref().unwrap();
         assert!(enc.channels.contains_key(&id));
         assert!(enc.write.is_empty());
-        assert!(matches!(
-            received.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        assert!(received.wait().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_closes_release_queues_without_waiting_for_ack() {
+        let mut session = authenticated_session();
+        for peer_first in [false, true] {
+            for _ in 0..256 {
+                let (id, mut received) = close_test_channel(&mut session, true);
+                let payload = bytes::Bytes::from(vec![42; 256]);
+                session.channels[&id]
+                    .send(ChannelMsg::Data {
+                        data: payload.clone(),
+                    })
+                    .await
+                    .unwrap();
+                if peer_first {
+                    let mut packet = vec![msg::CHANNEL_CLOSE];
+                    id.encode(&mut packet).unwrap();
+                    session
+                        .process_packet(&mut TestHandler, &packet)
+                        .await
+                        .unwrap();
+                } else {
+                    // No peer reply is delivered anywhere in this path.
+                    session.close(id).unwrap();
+                }
+                assert!(session.channels.is_empty());
+                let enc = session.common.encrypted.as_mut().unwrap();
+                assert!(enc.channels.is_empty());
+                enc.write.clear();
+                assert!(
+                    matches!(received.wait().await, Some(ChannelMsg::Data { data }) if data == payload)
+                );
+                if peer_first {
+                    assert!(matches!(received.wait().await, Some(ChannelMsg::Close)));
+                }
+                // Check closure independently of this loop's cooperative budget.
+                let end = tokio::task::unconstrained(received.wait()).now_or_never();
+                assert!(matches!(end, Some(None)));
+                assert!(payload.is_unique());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_close_releases_receiver_while_outbound_data_waits() {
+        let mut session = authenticated_session();
+        let (id, mut received) = close_test_channel(&mut session, true);
+        session
+            .data(id, bytes::Bytes::from_static(b"unsent"))
+            .unwrap();
+        session.close(id).unwrap();
+        assert!(!session.channels.contains_key(&id));
+        assert!(matches!(received.wait().now_or_never(), Some(None)));
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels[&id].pending_close);
+        assert!(enc.has_pending_data(id));
+        assert!(enc.write.is_empty());
+
+        let mut packet = vec![msg::CHANNEL_CLOSE];
+        id.encode(&mut packet).unwrap();
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels.is_empty());
+        assert!(!enc.has_any_pending_data());
+        assert_eq!(enc.write[4], msg::CHANNEL_CLOSE);
+    }
+
+    #[tokio::test]
+    async fn local_close_drops_only_its_pending_delivery_and_credit() {
+        let mut session = authenticated_session();
+        let (id, mut received) = close_test_channel(&mut session, true);
+        let (other, mut other_received) = close_test_channel(&mut session, true);
+        let credit = session.receive_credit(id).unwrap();
+        let sender = std::ops::Deref::deref(&session.channels[&id]).clone();
+        for _ in 0..8 {
+            sender
+                .send(ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"queued"),
+                })
+                .await
+                .unwrap();
+        }
+        session.pending_channel_data = Some(PendingChannelData::new(
+            id,
+            bytes::Bytes::from_static(b"pending"),
+            None,
+            sender,
         ));
+
+        session.close(other).unwrap();
+        assert!(session.pending_channel_data.is_some());
+        assert!(matches!(other_received.wait().now_or_never(), Some(None)));
+        session.close(id).unwrap();
+        assert!(session.pending_channel_data.is_none());
+        assert!(session.channels.is_empty());
+        credit.consumed(1);
+        assert!(!session.flush_receive_credit(id).unwrap());
+        for _ in 0..8 {
+            assert!(
+                matches!(received.wait().await, Some(ChannelMsg::Data { data }) if data.as_ref() == b"queued")
+            );
+        }
+        assert!(matches!(received.wait().now_or_never(), Some(None)));
     }
 
     fn receive(session: &mut Session, channel: ChannelId, len: usize) {

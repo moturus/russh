@@ -538,6 +538,8 @@ impl Session {
     }
 
     pub fn close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        // A peer need not acknowledge our close; release its inbound queue now.
+        self.channels.remove(&channel);
         if let Some(ref mut enc) = self.common.encrypted {
             enc.close(channel)
         } else {
