@@ -301,6 +301,13 @@ impl Encrypted {
         Ok(())
     }
 
+    /// A peer close ends sending even when its receive window never reopens.
+    pub fn close_from_peer(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        self.byte(channel, msg::CHANNEL_CLOSE)?;
+        self.channels.remove(&channel);
+        Ok(())
+    }
+
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
         if let Some(channel) = self.channels.get(&channel) {
             channel.sender_window_size as usize
@@ -1123,6 +1130,38 @@ mod tests {
             pending_eof,
             pending_close,
         }
+    }
+
+    #[test]
+    fn peer_close_discards_starved_data_and_deferred_controls() {
+        let closed = ChannelId(10);
+        let other = ChannelId(11);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(closed, test_channel_windowed(closed, 42, 0, true, true));
+        encrypted
+            .channels
+            .insert(other, test_ready_channel(other, 43));
+        assert!(encrypted.has_any_pending_data());
+
+        encrypted.close_from_peer(closed).unwrap();
+        assert!(!encrypted.channels.contains_key(&closed));
+        assert!(!encrypted.has_any_pending_data());
+        encrypted.eof(other).unwrap();
+        assert_eq!(
+            packet_types(&encrypted.write),
+            vec![msg::CHANNEL_CLOSE, msg::CHANNEL_EOF]
+        );
+
+        // A late duplicate cannot produce a second reply or affect its neighbor.
+        encrypted.close_from_peer(closed).unwrap();
+        encrypted.flush_all_pending().unwrap();
+        assert_eq!(
+            packet_types(&encrypted.write),
+            vec![msg::CHANNEL_CLOSE, msg::CHANNEL_EOF]
+        );
+        assert!(encrypted.channels.contains_key(&other));
     }
 
     #[test]

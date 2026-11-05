@@ -2532,6 +2532,94 @@ mod tests {
         packet
     }
 
+    #[cfg(feature = "flate2")]
+    fn close_test_channel(
+        session: &mut Session,
+        confirmed: bool,
+    ) -> (ChannelId, tokio::sync::mpsc::Receiver<ChannelMsg>) {
+        let enc = session.common.encrypted.as_mut().unwrap();
+        let id = enc.new_channel(1024, 128);
+        let params = enc.channels.get_mut(&id).unwrap();
+        params.recipient_channel = 42;
+        params.recipient_maximum_packet_size = 128;
+        params.confirmed = confirmed;
+        let (sender, receiver) = channel(8);
+        session
+            .channels
+            .insert(id, crate::channels::ChannelRef::new(sender));
+        (id, receiver)
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn peer_close_releases_starved_channel_after_received_data() {
+        let mut session = authenticated_session();
+        let (id, mut received) = close_test_channel(&mut session, true);
+        session
+            .data(id, bytes::Bytes::from_static(b"unsent"))
+            .unwrap();
+        assert!(
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .has_any_pending_data()
+        );
+        session.channels[&id]
+            .send(ChannelMsg::Data {
+                data: bytes::Bytes::from_static(b"received"),
+            })
+            .await
+            .unwrap();
+        let mut packet = vec![msg::CHANNEL_CLOSE];
+        id.encode(&mut packet).unwrap();
+
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(!enc.has_any_pending_data());
+        assert!(!enc.channels.contains_key(&id));
+        assert!(!session.channels.contains_key(&id));
+        assert_eq!(enc.write[4], msg::CHANNEL_CLOSE);
+        assert!(
+            matches!(received.recv().await, Some(ChannelMsg::Data { data }) if data.as_ref() == b"received")
+        );
+        assert!(matches!(received.recv().await, Some(ChannelMsg::Close)));
+        assert!(received.recv().await.is_none());
+
+        let written = enc.write.clone();
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
+        assert_eq!(session.common.encrypted.as_ref().unwrap().write, written);
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn peer_close_keeps_unconfirmed_open() {
+        let mut session = authenticated_session();
+        let (id, mut received) = close_test_channel(&mut session, false);
+        let mut packet = vec![msg::CHANNEL_CLOSE];
+        id.encode(&mut packet).unwrap();
+
+        session
+            .process_packet(&mut TestHandler, &packet)
+            .await
+            .unwrap();
+        assert!(session.channels.contains_key(&id));
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels.contains_key(&id));
+        assert!(enc.write.is_empty());
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn oversized_keyboard_interactive_prompt_count_is_rejected() {
         let (mut session, _sender, mut replies) = keyboard_interactive_session();
