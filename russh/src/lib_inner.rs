@@ -495,6 +495,107 @@ impl Display for ChannelId {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ReceiveCreditState {
+    channel: ChannelId,
+    consumed: std::sync::atomic::AtomicU32,
+    released: std::sync::atomic::AtomicBool,
+    queued: std::sync::atomic::AtomicBool,
+    dirty: tokio::sync::mpsc::UnboundedSender<ChannelId>,
+}
+
+impl ReceiveCreditState {
+    fn new(channel: ChannelId, dirty: tokio::sync::mpsc::UnboundedSender<ChannelId>) -> Self {
+        Self {
+            channel,
+            consumed: 0.into(),
+            released: false.into(),
+            queued: false.into(),
+            dirty,
+        }
+    }
+
+    fn mark_dirty(&self) {
+        if !self.queued.swap(true, std::sync::atomic::Ordering::AcqRel)
+            && self.dirty.send(self.channel).is_err()
+        {
+            self.queued
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    pub(crate) fn clear_dirty(&self) {
+        self.queued
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn pending(&self) -> u32 {
+        self.consumed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn take_pending(&self) -> u32 {
+        self.consumed.swap(0, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Returns receive-window credit as an application consumes channel data.
+///
+/// Obtain this from [`server::Session::receive_credit`]. Dropping the last
+/// handle restores automatic window replenishment.
+#[derive(Debug)]
+pub struct ReceiveCredit {
+    state: std::sync::Arc<ReceiveCreditState>,
+}
+
+impl ReceiveCredit {
+    pub(crate) fn new(state: std::sync::Arc<ReceiveCreditState>) -> Self {
+        state
+            .released
+            .store(false, std::sync::atomic::Ordering::Release);
+        Self { state }
+    }
+
+    /// Report bytes that have been consumed by the downstream application.
+    ///
+    /// Calls are non-blocking and may be made from a session callback.
+    pub fn consumed(&self, bytes: u32) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self.state.consumed.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |pending| Some(pending.saturating_add(bytes)),
+        );
+        self.state.mark_dirty();
+    }
+}
+
+impl Clone for ReceiveCredit {
+    fn clone(&self) -> Self {
+        Self {
+            state: std::sync::Arc::clone(&self.state),
+        }
+    }
+}
+
+impl Drop for ReceiveCredit {
+    fn drop(&mut self) {
+        // The channel owns the other reference. Wake the session before this
+        // last application reference disappears so it can restore auto mode.
+        if std::sync::Arc::strong_count(&self.state) == 2 {
+            self.state
+                .released
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.state.mark_dirty();
+        }
+    }
+}
+
 /// The parameters of a channel.
 #[derive(Debug)]
 pub(crate) struct ChannelParams {
@@ -508,6 +609,7 @@ pub(crate) struct ChannelParams {
     sender_window_size_max: u32,
     /// Bytes received beyond the window extended to the peer.
     sender_window_exceeded: u32,
+    application_consumed: Option<std::sync::Arc<ReceiveCreditState>>,
     /// Has the other side confirmed the channel?
     pub confirmed: bool,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -524,6 +626,15 @@ impl ChannelParams {
         self.recipient_window_size = c.initial_window_size;
         self.recipient_maximum_packet_size = c.maximum_packet_size;
         self.confirmed = true;
+    }
+
+    pub(crate) fn application_receive_credit(
+        &mut self,
+        dirty: tokio::sync::mpsc::UnboundedSender<ChannelId>,
+    ) -> std::sync::Arc<ReceiveCreditState> {
+        std::sync::Arc::clone(self.application_consumed.get_or_insert_with(|| {
+            std::sync::Arc::new(ReceiveCreditState::new(self.sender_channel, dirty))
+        }))
     }
 
     pub(crate) fn take_pending_controls(&mut self) -> (bool, bool) {

@@ -1115,11 +1115,14 @@ where
     };
 
     let common = read_ssh_id(config, &mut stream).await?;
+    let (receive_credit_sender, receive_credit_receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut session = Session {
         target_window_size: common.config.window_size,
         common,
         priority_receiver,
         receiver,
+        receive_credit_sender,
+        receive_credit_receiver,
         sender: handle.clone(),
         pending_reads: Vec::new(),
         pending_len: 0,

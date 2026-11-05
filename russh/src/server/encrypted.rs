@@ -826,6 +826,8 @@ mod tests {
             sender,
             channel_buffer_size: config.channel_buffer_size,
         };
+        let (receive_credit_sender, receive_credit_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         Session {
             target_window_size: config.window_size,
@@ -847,6 +849,8 @@ mod tests {
             },
             priority_receiver,
             receiver,
+            receive_credit_sender,
+            receive_credit_receiver,
             sender: handle,
             pending_reads: Vec::new(),
             pending_len: 0,
@@ -1500,6 +1504,7 @@ impl Session {
                             self.target_window_size = window
                         }
                     }
+                    enc.flush_receive_credit(channel_num, self.target_window_size)?;
                 }
                 self.flush()?;
                 if let Some(ext) = ext {
@@ -2051,6 +2056,7 @@ impl Session {
             sender_maximum_packet_size: self.common.config.maximum_packet_size,
             sender_window_size_max: self.common.config.window_size,
             sender_window_exceeded: 0,
+            application_consumed: None,
             confirmed: true,
             wants_reply: false,
             pending_data: std::collections::VecDeque::new(),

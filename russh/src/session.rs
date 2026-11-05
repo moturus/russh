@@ -397,16 +397,82 @@ impl Encrypted {
         let Some(channel) = self.channels.get_mut(&channel) else {
             return Ok(false);
         };
+        if let Some(state) = channel.application_consumed.as_ref() {
+            if !state.is_released() {
+                return Ok(false);
+            }
+            state.clear_dirty();
+            state.take_pending();
+            channel.application_consumed = None;
+        }
+        Self::refill_channel(&mut self.write, channel, target)
+    }
+
+    fn refill_channel(
+        write: &mut Vec<u8>,
+        channel: &mut ChannelParams,
+        target: u32,
+    ) -> Result<bool, crate::Error> {
         channel.sender_window_size_max = channel.sender_window_size_max.max(target);
         if channel.sender_window_size >= target / 2 {
             return Ok(false);
         }
+        push_packet!(write, {
+            write.push(msg::CHANNEL_WINDOW_ADJUST);
+            channel.recipient_channel.encode(&mut *write)?;
+            (target - channel.sender_window_size).encode(&mut *write)?;
+        });
+        channel.sender_window_size = target;
+        Ok(true)
+    }
+
+    /// Return consumption reported by one application-controlled channel.
+    ///
+    /// This is the `channel_check_window()` policy from OpenSSH: coalesce small
+    /// reports until the window is more than three packets down or below half.
+    pub(crate) fn flush_receive_credit(
+        &mut self,
+        channel: ChannelId,
+        target: u32,
+    ) -> Result<bool, crate::Error> {
+        let Some(channel) = self.channels.get_mut(&channel) else {
+            return Ok(false);
+        };
+        let Some(state) = channel.application_consumed.as_ref().cloned() else {
+            return Ok(false);
+        };
+        state.clear_dirty();
+        if state.is_released() {
+            state.take_pending();
+            channel.application_consumed = None;
+            return Self::refill_channel(&mut self.write, channel, target);
+        }
+        if !channel.confirmed || channel.pending_close || state.pending() == 0 {
+            return Ok(false);
+        }
+
+        let drawn_down = channel
+            .sender_window_size_max
+            .saturating_sub(channel.sender_window_size);
+        if drawn_down <= channel.sender_maximum_packet_size.saturating_mul(3)
+            && channel.sender_window_size >= channel.sender_window_size_max / 2
+        {
+            return Ok(false);
+        }
+        let amount = state.take_pending().min(drawn_down);
+        if amount == 0 {
+            return Ok(false);
+        }
+        channel.sender_window_size += amount;
+        debug!(
+            "channel {}: window {} sent adjust {}",
+            channel.sender_channel, channel.sender_window_size, amount
+        );
         push_packet!(self.write, {
             self.write.push(msg::CHANNEL_WINDOW_ADJUST);
             channel.recipient_channel.encode(&mut self.write)?;
-            (target - channel.sender_window_size).encode(&mut self.write)?;
+            amount.encode(&mut self.write)?;
         });
-        channel.sender_window_size = target;
         Ok(true)
     }
 
@@ -855,6 +921,7 @@ impl Encrypted {
                     recipient_maximum_packet_size: 0,
                     sender_window_size_max: window_size,
                     sender_window_exceeded: 0,
+                    application_consumed: None,
                     confirmed: false,
                     wants_reply: false,
                     pending_data: std::collections::VecDeque::new(),
@@ -986,6 +1053,7 @@ mod tests {
             sender_maximum_packet_size: 1024,
             sender_window_size_max: 1024,
             sender_window_exceeded: 0,
+            application_consumed: None,
             confirmed: true,
             wants_reply: false,
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
@@ -1042,6 +1110,7 @@ mod tests {
             sender_maximum_packet_size: 1024,
             sender_window_size_max: 1024,
             sender_window_exceeded: 0,
+            application_consumed: None,
             confirmed: true,
             wants_reply: false,
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
