@@ -783,7 +783,6 @@ impl Session {
         while !self.common.disconnected {
             self.common.received_data = false;
             let mut sent_keepalive = false;
-            let has_pending_channel_data = self.pending_channel_data.is_some();
 
             // Drain messages already queued on the session channel (e.g. shell
             // output pushed via `Handle::data()` from a spawned task) before
@@ -833,6 +832,7 @@ impl Session {
             let rekey_timer = future_or_pending(self.rekey_time_remaining(), tokio::time::sleep);
             pin!(rekey_timer);
 
+            let has_pending_channel_data = self.pending_channel_data.is_some();
             tokio::select! {
                 r = &mut reading, if !has_pending_channel_data => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
@@ -2027,6 +2027,74 @@ mod tests {
             );
         }
         assert!(matches!(received.wait().now_or_never(), Some(None)));
+    }
+
+    #[tokio::test]
+    async fn pending_delivery_close_from_drain_resumes_other_channel() {
+        pending_delivery_close_resumes_other_channel(true).await;
+    }
+
+    #[tokio::test]
+    async fn pending_delivery_close_from_select_resumes_other_channel() {
+        pending_delivery_close_resumes_other_channel(false).await;
+    }
+
+    async fn pending_delivery_close_resumes_other_channel(queued_before_run: bool) {
+        let mut session = authenticated_session();
+        let config = Arc::get_mut(&mut session.common.config).unwrap();
+        config.inactivity_timeout = None;
+        config.keepalive_interval = None;
+        session.common.encrypted.as_mut().unwrap().decompress = Decompress::None;
+        assert_eq!(session.rekey_time_remaining(), None);
+        let (parked, _parked_channel) = close_test_channel(&mut session, true);
+        let (other_id, mut other) = close_test_channel(&mut session, true);
+        let sender = std::ops::Deref::deref(&session.channels[&parked]).clone();
+        for _ in 0..8 {
+            sender
+                .send(ChannelMsg::Data {
+                    data: bytes::Bytes::from_static(b"queued"),
+                })
+                .await
+                .unwrap();
+        }
+        let mut pending =
+            PendingChannelData::new(parked, bytes::Bytes::from_static(b"pending"), None, sender);
+        // Prove delivery is parked without allowing the consumer to free a slot.
+        assert!(pending.permit.as_mut().now_or_never().is_none());
+        session.pending_channel_data = Some(pending);
+
+        let (socket, mut peer) = tokio::io::duplex(4096);
+        let mut packets = PacketWriter::clear();
+        packets
+            .write_packet(|buf| {
+                msg::CHANNEL_DATA.encode(buf)?;
+                other_id.encode(buf)?;
+                b"still reading".as_slice().encode(buf)?;
+                Ok(())
+            })
+            .unwrap();
+        packets.flush_into(&mut peer).await.unwrap();
+
+        let handle = session.handle();
+        let mut running = Box::pin(session.run(crate::ssh_read::SshRead::new(socket), TestHandler));
+        if !queued_before_run {
+            // With no queued close, enter select while the delivery is parked.
+            assert!(running.as_mut().now_or_never().is_none());
+        }
+        // Otherwise the first pre-select drain must dispatch this queued close.
+        handle.close(parked).await.unwrap();
+
+        let message = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                result = &mut running => panic!("session ended before delivery: {result:?}"),
+                message = other.wait() => message,
+            }
+        })
+        .await
+        .expect("local close left socket reads disabled");
+        assert!(
+            matches!(message, Some(ChannelMsg::Data { data }) if data.as_ref() == b"still reading")
+        );
     }
 
     fn receive(session: &mut Session, channel: ChannelId, len: usize) {
