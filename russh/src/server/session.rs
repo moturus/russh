@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::ErrorKind;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +9,9 @@ use channels::WindowSizeRef;
 use kex::ServerKex;
 use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, channel};
+use tokio::sync::mpsc::{
+    OwnedPermit, Receiver, Sender, UnboundedReceiver, UnboundedSender, channel,
+};
 use tokio::sync::oneshot;
 
 use super::*;
@@ -25,12 +29,54 @@ pub struct Session {
     pub(crate) receiver: Receiver<Msg>,
     pub(crate) receive_credit_sender: tokio::sync::mpsc::UnboundedSender<ChannelId>,
     pub(crate) receive_credit_receiver: tokio::sync::mpsc::UnboundedReceiver<ChannelId>,
+    pub(crate) pending_channel_data: Option<PendingChannelData>,
     pub(crate) target_window_size: u32,
     pub(crate) pending_reads: Vec<Vec<u8>>,
     pub(crate) pending_len: u32,
     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
     pub(crate) open_global_requests: VecDeque<GlobalRequestResponse>,
     pub(crate) kex: SessionKexState<ServerKex>,
+}
+
+type ChannelPermit = Pin<
+    Box<
+        dyn Future<
+                Output = Result<OwnedPermit<ChannelMsg>, tokio::sync::mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
+
+pub(crate) struct PendingChannelData {
+    channel: ChannelId,
+    data: bytes::Bytes,
+    ext: Option<u32>,
+    permit: ChannelPermit,
+}
+
+impl std::fmt::Debug for PendingChannelData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingChannelData")
+            .field("channel", &self.channel)
+            .field("data_len", &self.data.len())
+            .field("ext", &self.ext)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingChannelData {
+    pub(crate) fn new(
+        channel: ChannelId,
+        data: bytes::Bytes,
+        ext: Option<u32>,
+        sender: Sender<ChannelMsg>,
+    ) -> Self {
+        Self {
+            channel,
+            data,
+            ext,
+            permit: Box::pin(sender.reserve_owned()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -652,6 +698,55 @@ impl Session {
         }
     }
 
+    pub(crate) fn replenish_receive_window<H: Handler>(
+        &mut self,
+        handler: &mut H,
+        channel: ChannelId,
+    ) -> Result<(), Error> {
+        if let Some(encrypted) = self.common.encrypted.as_mut() {
+            if encrypted.refill_receive_window(channel, self.target_window_size)? {
+                let window = handler.adjust_window(channel, self.target_window_size);
+                if window > 0 {
+                    self.target_window_size = window;
+                }
+            }
+            encrypted.flush_receive_credit(channel, self.target_window_size)?;
+        }
+        Ok(())
+    }
+
+    async fn complete_pending_channel_data<H: Handler + Send>(
+        &mut self,
+        handler: &mut H,
+        permit: Result<OwnedPermit<ChannelMsg>, tokio::sync::mpsc::error::SendError<()>>,
+    ) -> Result<(), H::Error> {
+        let Some(pending) = self.pending_channel_data.take() else {
+            return Err(Error::Inconsistent.into());
+        };
+        if let Ok(permit) = permit {
+            let message = match pending.ext {
+                Some(ext) => ChannelMsg::ExtendedData {
+                    ext,
+                    data: pending.data.clone(),
+                },
+                None => ChannelMsg::Data {
+                    data: pending.data.clone(),
+                },
+            };
+            permit.send(message);
+        }
+        self.replenish_receive_window(handler, pending.channel)?;
+        self.flush()?;
+        match pending.ext {
+            Some(ext) => {
+                handler
+                    .extended_data(pending.channel, ext, &pending.data, self)
+                    .await
+            }
+            None => handler.data(pending.channel, &pending.data, self).await,
+        }
+    }
+
     pub(crate) async fn run<H, R>(
         mut self,
         mut stream: SshRead<R>,
@@ -688,6 +783,7 @@ impl Session {
         while !self.common.disconnected {
             self.common.received_data = false;
             let mut sent_keepalive = false;
+            let has_pending_channel_data = self.pending_channel_data.is_some();
 
             // Drain messages already queued on the session channel (e.g. shell
             // output pushed via `Handle::data()` from a spawned task) before
@@ -738,7 +834,7 @@ impl Session {
             pin!(rekey_timer);
 
             tokio::select! {
-                r = &mut reading => {
+                r = &mut reading, if !has_pending_channel_data => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
                         Err(e) => return Err(e.into())
@@ -832,6 +928,12 @@ impl Session {
                     if let Some(channel) = channel {
                         self.flush_receive_credit(channel)?;
                     }
+                }
+                permit = future_or_pending(
+                    self.pending_channel_data.as_mut(),
+                    |pending| pending.permit.as_mut(),
+                ), if has_pending_channel_data => {
+                    self.complete_pending_channel_data(&mut handler, permit).await?;
                 }
             }
             self.flush()?;
@@ -1701,6 +1803,7 @@ mod tests {
             receiver,
             receive_credit_sender,
             receive_credit_receiver,
+            pending_channel_data: None,
             target_window_size: config.window_size,
             pending_reads: Vec::new(),
             pending_len: 0,

@@ -7,6 +7,7 @@ use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelMsg, client};
 use ssh_key::PrivateKey;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, sleep, timeout};
 
@@ -90,6 +91,49 @@ async fn server_handle_data_backpressures_when_client_stops_reading() -> Result<
     .await?;
 
     assert_eq!(received, HANDLE_DATA_COUNT * WINDOW_SIZE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_server_channel_queue_does_not_block_outbound_data() -> Result<(), anyhow::Error> {
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(InboundQueueServer::run(listener));
+
+    let config = Arc::new(client::Config::default());
+    let key = Arc::new(PrivateKey::random(
+        &mut rand::rng(),
+        ssh_key::Algorithm::Ed25519,
+    )?);
+    let mut session = russh::client::connect(config, addr, Client).await?;
+    assert!(
+        session
+            .authenticate_publickey(
+                "user",
+                PrivateKeyWithHashAlg::new(
+                    key,
+                    session.best_supported_rsa_hash().await.unwrap().flatten(),
+                ),
+            )
+            .await?
+            .success()
+    );
+    let mut channel = session.channel_open_session().await?;
+
+    channel.data(&[1][..]).await?;
+    channel.data(&[2][..]).await?;
+    let output = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(ChannelMsg::Data { data }) = channel.wait().await {
+                break data;
+            }
+        }
+    })
+    .await?;
+    assert_eq!(output.as_ref(), b"output");
+
+    server.abort();
+    let _ = server.await;
     Ok(())
 }
 
@@ -212,6 +256,70 @@ impl russh::client::Handler for Client {
 
     async fn check_server_key(&mut self, _: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+}
+
+#[derive(Clone)]
+struct InboundQueueServer;
+
+impl InboundQueueServer {
+    async fn run(listener: TokioTcpListener) {
+        let config = Arc::new(server::Config {
+            keys: vec![PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap()],
+            channel_buffer_size: 1,
+            event_buffer_size: 1,
+            ..Default::default()
+        });
+        let mut server = Self;
+        server.run_on_socket(config, &listener).await.unwrap();
+    }
+}
+
+impl russh::server::Server for InboundQueueServer {
+    type Handler = Self;
+
+    fn new_client(&mut self, _: Option<SocketAddr>) -> Self::Handler {
+        self.clone()
+    }
+}
+
+impl russh::server::Handler for InboundQueueServer {
+    type Error = anyhow::Error;
+
+    async fn auth_publickey(
+        &mut self,
+        _: &str,
+        _: server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        Ok(Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        tokio::spawn(async move {
+            let _channel = channel;
+            std::future::pending::<()>().await;
+        });
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: russh::ChannelId,
+        _data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let handle = session.handle();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            let _ = handle.data(channel, b"output".as_slice()).await;
+        });
+        Ok(())
     }
 }
 

@@ -1123,6 +1123,7 @@ where
         receiver,
         receive_credit_sender,
         receive_credit_receiver,
+        pending_channel_data: None,
         sender: handle.clone(),
         pending_reads: Vec::new(),
         pending_len: 0,
