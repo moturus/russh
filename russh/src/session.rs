@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use byteorder::{BigEndian, ByteOrder};
 use bytes::Bytes;
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use ssh_encoding::Encode;
 use tokio::sync::oneshot;
 
@@ -110,6 +110,13 @@ pub(crate) enum ChannelFlushResult {
         pending_eof: bool,
         pending_close: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReceiveWindowState {
+    Accepted,
+    Discarded,
+    ProtocolError,
 }
 impl ChannelFlushResult {
     pub(crate) fn wrote(&self) -> usize {
@@ -333,6 +340,74 @@ impl Encrypted {
             }
         }
         Ok(false)
+    }
+
+    /// Spend receive-window credit for an incoming channel-data packet.
+    ///
+    /// OpenSSH gives ordinary data a small compatibility grace when a peer
+    /// overruns its window, but discards extended data that exceeds it. RFC
+    /// 4254 also requires every data packet to fit the advertised maximum.
+    pub(crate) fn consume_receive_window(
+        &mut self,
+        channel: ChannelId,
+        len: usize,
+        extended: bool,
+    ) -> ReceiveWindowState {
+        let Some(channel) = self.channels.get_mut(&channel) else {
+            return ReceiveWindowState::Discarded;
+        };
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+
+        if len > channel.sender_maximum_packet_size {
+            warn!(
+                "channel {}: data packet too large: {} > {}",
+                channel.sender_channel, len, channel.sender_maximum_packet_size
+            );
+            return ReceiveWindowState::ProtocolError;
+        }
+        if len > channel.sender_window_size {
+            warn!(
+                "channel {}: received too much data: {} > {}",
+                channel.sender_channel, len, channel.sender_window_size
+            );
+            if extended {
+                return ReceiveWindowState::Discarded;
+            }
+            channel.sender_window_exceeded = channel
+                .sender_window_exceeded
+                .saturating_add(len - channel.sender_window_size);
+            channel.sender_window_size = 0;
+            if channel.sender_window_exceeded > channel.sender_window_size_max / 10 {
+                return ReceiveWindowState::ProtocolError;
+            }
+            return ReceiveWindowState::Accepted;
+        }
+
+        channel.sender_window_size -= len;
+        channel.sender_window_exceeded = 0;
+        ReceiveWindowState::Accepted
+    }
+
+    /// Replenish an automatically managed receive window after data arrives.
+    pub(crate) fn refill_receive_window(
+        &mut self,
+        channel: ChannelId,
+        target: u32,
+    ) -> Result<bool, crate::Error> {
+        let Some(channel) = self.channels.get_mut(&channel) else {
+            return Ok(false);
+        };
+        channel.sender_window_size_max = channel.sender_window_size_max.max(target);
+        if channel.sender_window_size >= target / 2 {
+            return Ok(false);
+        }
+        push_packet!(self.write, {
+            self.write.push(msg::CHANNEL_WINDOW_ADJUST);
+            channel.recipient_channel.encode(&mut self.write)?;
+            (target - channel.sender_window_size).encode(&mut self.write)?;
+        });
+        channel.sender_window_size = target;
+        Ok(true)
     }
 
     fn flush_channel(
@@ -778,6 +853,8 @@ impl Encrypted {
                     recipient_window_size: 0,
                     sender_maximum_packet_size: maxpacket,
                     recipient_maximum_packet_size: 0,
+                    sender_window_size_max: window_size,
+                    sender_window_exceeded: 0,
                     confirmed: false,
                     wants_reply: false,
                     pending_data: std::collections::VecDeque::new(),
@@ -865,7 +942,7 @@ mod tests {
     use byteorder::{BigEndian, ByteOrder};
     use bytes::Bytes;
 
-    use super::{Encrypted, EncryptedState, Exchange};
+    use super::{Encrypted, EncryptedState, Exchange, ReceiveWindowState};
     use crate::compression::{Compression, Decompress};
     use crate::kex::{KEXES, NONE};
     use crate::sshbuffer::PacketWriter;
@@ -907,6 +984,8 @@ mod tests {
             sender_window_size: 1024,
             recipient_maximum_packet_size: 1024,
             sender_maximum_packet_size: 1024,
+            sender_window_size_max: 1024,
+            sender_window_exceeded: 0,
             confirmed: true,
             wants_reply: false,
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
@@ -961,12 +1040,91 @@ mod tests {
             sender_window_size: 1024,
             recipient_maximum_packet_size: 1024,
             sender_maximum_packet_size: 1024,
+            sender_window_size_max: 1024,
+            sender_window_exceeded: 0,
             confirmed: true,
             wants_reply: false,
             pending_data: VecDeque::from([(Bytes::from_static(b"hello"), None, 0)]),
             pending_eof,
             pending_close,
         }
+    }
+
+    #[test]
+    fn receive_window_rejects_packets_larger_than_advertised() {
+        let channel = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(channel, test_ready_channel(channel, 42));
+
+        assert_eq!(
+            encrypted.consume_receive_window(channel, 1025, false),
+            ReceiveWindowState::ProtocolError
+        );
+        assert_eq!(encrypted.channels[&channel].sender_window_size, 1024);
+    }
+
+    #[test]
+    fn ordinary_data_gets_openssh_window_overrun_grace() {
+        let channel = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        let mut params = test_ready_channel(channel, 42);
+        params.sender_maximum_packet_size = 2048;
+        encrypted.channels.insert(channel, params);
+
+        assert_eq!(
+            encrypted.consume_receive_window(channel, 1100, false),
+            ReceiveWindowState::Accepted
+        );
+        assert_eq!(encrypted.channels[&channel].sender_window_size, 0);
+        assert_eq!(encrypted.channels[&channel].sender_window_exceeded, 76);
+        assert_eq!(
+            encrypted.consume_receive_window(channel, 27, false),
+            ReceiveWindowState::ProtocolError
+        );
+    }
+
+    #[test]
+    fn in_window_data_resets_the_overrun_grace() {
+        let channel = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        let mut params = test_ready_channel(channel, 42);
+        params.sender_maximum_packet_size = 2048;
+        encrypted.channels.insert(channel, params);
+
+        assert_eq!(
+            encrypted.consume_receive_window(channel, 1100, false),
+            ReceiveWindowState::Accepted
+        );
+        assert_eq!(encrypted.channels[&channel].sender_window_exceeded, 76);
+
+        // The peer catches up after a window adjustment; data that fits the
+        // window clears the accumulated excess, as in channel_input_data().
+        let params = encrypted.channels.get_mut(&channel).unwrap();
+        params.sender_window_size = 512;
+        assert_eq!(
+            encrypted.consume_receive_window(channel, 100, false),
+            ReceiveWindowState::Accepted
+        );
+        assert_eq!(encrypted.channels[&channel].sender_window_exceeded, 0);
+        assert_eq!(encrypted.channels[&channel].sender_window_size, 412);
+    }
+
+    #[test]
+    fn extended_data_overrun_is_discarded_like_openssh() {
+        let channel = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        let mut params = test_ready_channel(channel, 42);
+        params.sender_window_size = 16;
+        encrypted.channels.insert(channel, params);
+
+        assert_eq!(
+            encrypted.consume_receive_window(channel, 17, true),
+            ReceiveWindowState::Discarded
+        );
+        assert_eq!(encrypted.channels[&channel].sender_window_size, 16);
+        assert_eq!(encrypted.channels[&channel].sender_window_exceeded, 0);
     }
 
     // flush_pending (single-channel path)
