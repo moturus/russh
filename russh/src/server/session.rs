@@ -27,8 +27,8 @@ pub struct Session {
     pub(crate) sender: Handle,
     pub(crate) priority_receiver: UnboundedReceiver<Msg>,
     pub(crate) receiver: Receiver<Msg>,
-    pub(crate) receive_credit_sender: tokio::sync::mpsc::UnboundedSender<ChannelId>,
-    pub(crate) receive_credit_receiver: tokio::sync::mpsc::UnboundedReceiver<ChannelId>,
+    pub(crate) receive_credit_sender: tokio::sync::mpsc::UnboundedSender<ReceiveWindowEvent>,
+    pub(crate) receive_credit_receiver: tokio::sync::mpsc::UnboundedReceiver<ReceiveWindowEvent>,
     pub(crate) pending_channel_data: Option<PendingChannelData>,
     pub(crate) target_window_size: u32,
     pub(crate) pending_reads: Vec<Vec<u8>>,
@@ -924,9 +924,17 @@ impl Session {
                         }
                     }
                 }
-                channel = self.receive_credit_receiver.recv(), if !self.kex.active() => {
-                    if let Some(channel) = channel {
-                        self.flush_receive_credit(channel)?;
+                event = self.receive_credit_receiver.recv(), if !self.kex.active() => {
+                    match event {
+                        Some(ReceiveWindowEvent::Credit(channel)) => {
+                            self.flush_receive_credit(channel)?;
+                        }
+                        Some(ReceiveWindowEvent::AbandonedOpen(channel)) => {
+                            if let Some(encrypted) = self.common.encrypted.as_mut() {
+                                encrypted.channels.remove(&channel);
+                            }
+                        }
+                        None => {}
                     }
                 }
                 permit = future_or_pending(
@@ -1225,9 +1233,12 @@ impl Session {
 
     fn finalize_channel_open_reply(
         &mut self,
-        pending: PendingChannelOpen,
+        mut pending: PendingChannelOpen,
         result: Result<(), ChannelOpenFailure>,
     ) -> Result<(), Error> {
+        if let Some(cleanup) = pending.channel_cleanup.take() {
+            cleanup.disarm();
+        }
         if let Some(ref mut enc) = self.common.encrypted {
             match result {
                 Ok(()) => {
@@ -1910,11 +1921,51 @@ mod tests {
         receive(&mut session, channel, 1024);
 
         drop(credit);
-        assert_eq!(session.receive_credit_receiver.try_recv(), Ok(channel));
+        assert!(matches!(
+            session.receive_credit_receiver.try_recv(),
+            Ok(ReceiveWindowEvent::Credit(id)) if id == channel
+        ));
         assert!(session.flush_receive_credit(channel).unwrap());
         let encrypted = session.common.encrypted.as_ref().unwrap();
         assert_eq!(encrypted.sender_window_size(channel), 1024);
         assert!(encrypted.channels[&channel].application_consumed.is_none());
+    }
+
+    #[test]
+    fn dropping_one_credit_clone_keeps_manual_accounting() {
+        let mut session = authenticated_session();
+        let (channel, credit) = manual_window_channel(&mut session);
+        let last_credit = credit.clone();
+        receive(&mut session, channel, 1024);
+
+        drop(credit);
+        assert!(session.receive_credit_receiver.try_recv().is_err());
+        assert!(!session.flush_receive_credit(channel).unwrap());
+        drop(last_credit);
+        assert!(matches!(
+            session.receive_credit_receiver.try_recv(),
+            Ok(ReceiveWindowEvent::Credit(id)) if id == channel
+        ));
+    }
+
+    #[test]
+    fn abandoned_channel_open_queues_provisional_cleanup() {
+        let mut session = authenticated_session();
+        let channel = session
+            .common
+            .encrypted
+            .as_mut()
+            .unwrap()
+            .new_channel(1024, 128);
+
+        drop(PendingChannelCleanup::new(
+            channel,
+            session.receive_credit_sender.clone(),
+        ));
+        assert!(matches!(
+            session.receive_credit_receiver.try_recv(),
+            Ok(ReceiveWindowEvent::AbandonedOpen(id)) if id == channel
+        ));
     }
 
     fn compressed_debug_payload(payload_len: usize) -> Vec<u8> {

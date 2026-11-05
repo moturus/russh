@@ -875,6 +875,7 @@ impl Session {
                     packet_size: self.common.config.maximum_packet_size,
                     channel_ref,
                     channel_params: Some(channel_params),
+                    channel_cleanup: None,
                 };
                 let reply = ChannelOpenHandle::new(
                     self.priority_sender.clone(),

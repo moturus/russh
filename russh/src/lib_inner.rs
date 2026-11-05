@@ -496,19 +496,30 @@ impl Display for ChannelId {
 }
 
 #[derive(Debug)]
+pub(crate) enum ReceiveWindowEvent {
+    Credit(ChannelId),
+    AbandonedOpen(ChannelId),
+}
+
+#[derive(Debug)]
 pub(crate) struct ReceiveCreditState {
     channel: ChannelId,
     consumed: std::sync::atomic::AtomicU32,
+    handles: std::sync::atomic::AtomicUsize,
     released: std::sync::atomic::AtomicBool,
     queued: std::sync::atomic::AtomicBool,
-    dirty: tokio::sync::mpsc::UnboundedSender<ChannelId>,
+    dirty: tokio::sync::mpsc::UnboundedSender<ReceiveWindowEvent>,
 }
 
 impl ReceiveCreditState {
-    fn new(channel: ChannelId, dirty: tokio::sync::mpsc::UnboundedSender<ChannelId>) -> Self {
+    fn new(
+        channel: ChannelId,
+        dirty: tokio::sync::mpsc::UnboundedSender<ReceiveWindowEvent>,
+    ) -> Self {
         Self {
             channel,
             consumed: 0.into(),
+            handles: 0.into(),
             released: false.into(),
             queued: false.into(),
             dirty,
@@ -517,7 +528,10 @@ impl ReceiveCreditState {
 
     fn mark_dirty(&self) {
         if !self.queued.swap(true, std::sync::atomic::Ordering::AcqRel)
-            && self.dirty.send(self.channel).is_err()
+            && self
+                .dirty
+                .send(ReceiveWindowEvent::Credit(self.channel))
+                .is_err()
         {
             self.queued
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -554,6 +568,9 @@ pub struct ReceiveCredit {
 impl ReceiveCredit {
     pub(crate) fn new(state: std::sync::Arc<ReceiveCreditState>) -> Self {
         state
+            .handles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state
             .released
             .store(false, std::sync::atomic::Ordering::Release);
         Self { state }
@@ -577,17 +594,18 @@ impl ReceiveCredit {
 
 impl Clone for ReceiveCredit {
     fn clone(&self) -> Self {
-        Self {
-            state: std::sync::Arc::clone(&self.state),
-        }
+        Self::new(std::sync::Arc::clone(&self.state))
     }
 }
 
 impl Drop for ReceiveCredit {
     fn drop(&mut self) {
-        // The channel owns the other reference. Wake the session before this
-        // last application reference disappears so it can restore auto mode.
-        if std::sync::Arc::strong_count(&self.state) == 2 {
+        if self
+            .state
+            .handles
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
             self.state
                 .released
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -630,7 +648,7 @@ impl ChannelParams {
 
     pub(crate) fn application_receive_credit(
         &mut self,
-        dirty: tokio::sync::mpsc::UnboundedSender<ChannelId>,
+        dirty: tokio::sync::mpsc::UnboundedSender<ReceiveWindowEvent>,
     ) -> std::sync::Arc<ReceiveCreditState> {
         std::sync::Arc::clone(self.application_consumed.get_or_insert_with(|| {
             std::sync::Arc::new(ReceiveCreditState::new(self.sender_channel, dirty))
@@ -659,6 +677,36 @@ pub(crate) async fn flush_or_timeout<W: AsyncWrite + Unpin>(
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingChannelCleanup {
+    channel: ChannelId,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<ReceiveWindowEvent>>,
+}
+
+impl PendingChannelCleanup {
+    pub(crate) fn new(
+        channel: ChannelId,
+        sender: tokio::sync::mpsc::UnboundedSender<ReceiveWindowEvent>,
+    ) -> Self {
+        Self {
+            channel,
+            sender: Some(sender),
+        }
+    }
+
+    pub(crate) fn disarm(mut self) {
+        self.sender = None;
+    }
+}
+
+impl Drop for PendingChannelCleanup {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(ReceiveWindowEvent::AbandonedOpen(self.channel));
+        }
+    }
+}
+
 /// Returns `f(val)` if `val` it is [Some], or a forever pending [Future] if it is [None].
 pub(crate) fn future_or_pending<R, F: Future<Output = R>, T>(
     val: Option<T>,
@@ -680,6 +728,7 @@ pub struct PendingChannelOpen {
     pub(crate) packet_size: u32,
     pub(crate) channel_ref: channels::ChannelRef,
     pub(crate) channel_params: Option<ChannelParams>,
+    pub(crate) channel_cleanup: Option<PendingChannelCleanup>,
 }
 
 /// A handle passed to channel-open callbacks that the handler uses to

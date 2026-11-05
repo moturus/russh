@@ -2083,6 +2083,10 @@ impl Session {
             packet_size: self.common.config.maximum_packet_size,
             channel_ref,
             channel_params: None,
+            channel_cleanup: Some(PendingChannelCleanup::new(
+                sender_channel,
+                self.receive_credit_sender.clone(),
+            )),
         };
         let reply = ChannelOpenHandle::new(
             self.sender.priority_sender.clone(),
