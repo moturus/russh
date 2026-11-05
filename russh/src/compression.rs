@@ -280,6 +280,47 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn partial_flush_limit_and_next_packet_round_trip() {
+        let mut comp = Compress::None;
+        let mut decomp = Decompress::None;
+        Compression::Zlib.init_compress(&mut comp);
+        Compression::Zlib.init_decompress(&mut decomp);
+        let at_limit = vec![b'A'; MAXIMUM_DECOMPRESSED_PACKET_LEN];
+
+        for payload in [at_limit.as_slice(), b"next packet"] {
+            let mut compressed = vec![0xa5; 4];
+            let len = comp.compress_into(payload, &mut compressed, 4).unwrap();
+            assert_eq!(&compressed[..4], &[0xa5; 4]);
+            assert_eq!(compressed.len(), 4 + len);
+            let mut output = Vec::new();
+            assert_eq!(
+                decomp.decompress(&compressed[4..], &mut output).unwrap(),
+                payload
+            );
+            // The next SSH packet must not inherit output from this one.
+            assert!(decomp.decompress(&[], &mut output).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn oversized_partial_flush_is_rejected() {
+        let mut comp = Compress::None;
+        let mut decomp = Decompress::None;
+        Compression::Zlib.init_compress(&mut comp);
+        Compression::Zlib.init_decompress(&mut decomp);
+        let payload = vec![b'A'; MAXIMUM_DECOMPRESSED_PACKET_LEN + 1];
+        let mut compressed = Vec::new();
+        comp.compress_into(&payload, &mut compressed, 0).unwrap();
+
+        let mut output = Vec::new();
+        assert!(matches!(
+            decomp.decompress(&compressed, &mut output),
+            Err(crate::Error::PacketSize(len)) if len > MAXIMUM_DECOMPRESSED_PACKET_LEN
+        ));
+        assert!(output.len() <= MAXIMUM_DECOMPRESSED_PACKET_LEN + 1);
+    }
 }
 
 #[cfg(feature = "flate2")]
