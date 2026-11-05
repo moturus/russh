@@ -2057,7 +2057,9 @@ impl Session {
             sender_window_size_max: self.common.config.window_size,
             sender_window_exceeded: 0,
             application_consumed: None,
-            confirmed: true,
+            // Inserted before the handler runs so it can select receive-window
+            // policy, but not established until its acceptance is finalized.
+            confirmed: false,
             wants_reply: false,
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,
@@ -2072,13 +2074,17 @@ impl Session {
             self.common.config.channel_buffer_size,
         );
 
+        let Some(encrypted) = self.common.encrypted.as_mut() else {
+            return Err(crate::Error::Inconsistent.into());
+        };
+        encrypted.channels.insert(sender_channel, channel_params);
         let pending = PendingChannelOpen {
             recipient_channel: msg.recipient_channel,
             sender_channel,
             window_size: self.common.config.window_size,
             packet_size: self.common.config.maximum_packet_size,
             channel_ref,
-            channel_params,
+            channel_params: None,
         };
         let reply = ChannelOpenHandle::new(
             self.sender.priority_sender.clone(),

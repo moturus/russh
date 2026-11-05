@@ -631,11 +631,13 @@ impl Session {
         Ok(())
     }
 
-    /// Put an established channel's receive window under application control.
+    /// Put a channel's receive window under application control.
     ///
     /// Russh then returns window credit only after the application reports
     /// consuming bytes through the returned handle. Repeated calls share the
-    /// same accounting state. Dropping every handle restores automatic mode.
+    /// same accounting state. This is available during a `channel_open_*`
+    /// callback, before russh confirms the channel and exposes its initial
+    /// window to the peer. Dropping every handle restores automatic mode.
     pub fn receive_credit(&mut self, channel: ChannelId) -> Option<ReceiveCredit> {
         let params = self.common.encrypted.as_mut()?.channels.get_mut(&channel)?;
         Some(ReceiveCredit::new(params.application_receive_credit(
@@ -1127,6 +1129,10 @@ impl Session {
         if let Some(ref mut enc) = self.common.encrypted {
             match result {
                 Ok(()) => {
+                    let Some(channel) = enc.channels.get_mut(&pending.sender_channel) else {
+                        return Err(Error::Inconsistent);
+                    };
+                    channel.confirmed = true;
                     push_packet!(enc.write, {
                         msg::CHANNEL_OPEN_CONFIRMATION.encode(&mut enc.write)?;
                         pending.recipient_channel.encode(&mut enc.write)?;
@@ -1134,12 +1140,11 @@ impl Session {
                         pending.window_size.encode(&mut enc.write)?;
                         pending.packet_size.encode(&mut enc.write)?;
                     });
-                    enc.channels
-                        .insert(pending.sender_channel, pending.channel_params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
                 }
                 Err(reason) => {
+                    enc.channels.remove(&pending.sender_channel);
                     push_packet!(enc.write, {
                         msg::CHANNEL_OPEN_FAILURE.encode(&mut enc.write)?;
                         pending.recipient_channel.encode(&mut enc.write)?;
@@ -1770,6 +1775,29 @@ mod tests {
                 .sender_window_size(channel),
             1024
         );
+    }
+
+    #[test]
+    fn released_credit_before_confirmation_sends_no_window_adjust() {
+        let mut session = authenticated_session();
+        // A raised session target would otherwise put a fresh window below
+        // the refill threshold and emit WINDOW_ADJUST before the channel's
+        // own CHANNEL_OPEN_CONFIRMATION.
+        session.target_window_size = 4096;
+        let encrypted = session.common.encrypted.as_mut().unwrap();
+        let channel = encrypted.new_channel(1024, 128);
+        encrypted
+            .channels
+            .get_mut(&channel)
+            .unwrap()
+            .recipient_channel = 17;
+        let credit = session.receive_credit(channel).unwrap();
+
+        drop(credit);
+        assert!(!session.flush_receive_credit(channel).unwrap());
+        let encrypted = session.common.encrypted.as_ref().unwrap();
+        assert_eq!(encrypted.sender_window_size(channel), 1024);
+        assert!(encrypted.channels[&channel].application_consumed.is_none());
     }
 
     #[test]

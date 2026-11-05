@@ -1850,8 +1850,10 @@ impl Session {
                         pending.window_size.encode(&mut enc.write)?;
                         pending.packet_size.encode(&mut enc.write)?;
                     });
-                    enc.channels
-                        .insert(pending.sender_channel, pending.channel_params);
+                    let Some(channel_params) = pending.channel_params else {
+                        return Err(crate::Error::Inconsistent);
+                    };
+                    enc.channels.insert(pending.sender_channel, channel_params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
                 }
@@ -2294,12 +2296,20 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(session
-            .process_packet(&mut TestHandler, &packet)
-            .await
-            .is_err());
+        assert!(
+            session
+                .process_packet(&mut TestHandler, &packet)
+                .await
+                .is_err()
+        );
         assert_eq!(
-            session.common.encrypted.as_ref().unwrap().received_extensions.len(),
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .received_extensions
+                .len(),
             2
         );
     }
@@ -2368,10 +2378,16 @@ mod tests {
     #[test]
     fn limit_triggered_rekey_waits_for_authentication() {
         let (mut session, _sender, _replies) = keyboard_interactive_session();
-        allow_rekey(&mut session, crate::Limits::new(0, 0, Duration::from_secs(3600)));
+        allow_rekey(
+            &mut session,
+            crate::Limits::new(0, 0, Duration::from_secs(3600)),
+        );
 
         session.flush().unwrap();
-        assert!(!session.kex.active(), "write limit hit before authentication");
+        assert!(
+            !session.kex.active(),
+            "write limit hit before authentication"
+        );
         assert_eq!(session.rekey_time_remaining(), None);
 
         session.common.encrypted.as_mut().unwrap().state = EncryptedState::Authenticated;

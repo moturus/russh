@@ -445,6 +445,12 @@ impl Encrypted {
         if state.is_released() {
             state.take_pending();
             channel.application_consumed = None;
+            // No message may precede this channel's own confirmation. An
+            // unconfirmed channel reverts to automatic accounting and gets
+            // the normal refill policy once it is established.
+            if !channel.confirmed {
+                return Ok(false);
+            }
             return Self::refill_channel(&mut self.write, channel, target);
         }
         if !channel.confirmed || channel.pending_close || state.pending() == 0 {
