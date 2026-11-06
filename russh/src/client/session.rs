@@ -9,7 +9,7 @@ use crate::{ChannelId, CryptoVec, Disconnect, Pty, ReceiveCredit, Sig, map_err, 
 impl Session {
     /// Put a registered channel's receive window under application control.
     ///
-    /// Call this from the open-confirmation callback to control the first data
+    /// Call this from an incoming-open or open-confirmation callback to control the first data
     /// packet. Credit is returned only as this handle reports consumption.
     /// Repeated calls share accounting; dropping the last restores automatic mode.
     pub fn receive_credit(&mut self, channel: ChannelId) -> Option<ReceiveCredit> {

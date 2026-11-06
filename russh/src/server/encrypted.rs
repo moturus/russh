@@ -2082,7 +2082,6 @@ impl Session {
             window_size: self.common.config.window_size,
             packet_size: self.common.config.maximum_packet_size,
             channel_ref,
-            channel_params: None,
             channel_cleanup: Some(PendingChannelCleanup::new(
                 sender_channel,
                 self.receive_credit_sender.clone(),

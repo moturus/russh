@@ -728,7 +728,6 @@ pub struct PendingChannelOpen {
     pub(crate) window_size: u32,
     pub(crate) packet_size: u32,
     pub(crate) channel_ref: channels::ChannelRef,
-    pub(crate) channel_params: Option<ChannelParams>,
     pub(crate) channel_cleanup: Option<PendingChannelCleanup>,
 }
 

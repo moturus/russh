@@ -32,7 +32,7 @@ use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage, e
 use crate::session::{Encrypted, EncryptedState, GlobalRequestResponse, ReceiveWindowState};
 use crate::{
     Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelParams, CryptoVec, Error, MethodSet,
-    Sig, auth, map_err, msg,
+    PendingChannelCleanup, Sig, auth, map_err, msg,
 };
 
 /// Checks a `hostkeys-prove-00@openssh.com` reply: one signature per requested
@@ -832,7 +832,7 @@ impl Session {
                     sender_window_size_max: self.common.config.window_size,
                     sender_window_exceeded: 0,
                     application_consumed: None,
-                    confirmed: true,
+                    confirmed: false,
                     wants_reply: false,
                     pending_data: std::collections::VecDeque::new(),
                     pending_eof: false,
@@ -847,14 +847,15 @@ impl Session {
                     self.common.config.channel_buffer_size,
                 );
 
+                self.common.encrypted.as_mut().ok_or(crate::Error::Inconsistent)?
+                    .channels.insert(id, channel_params);
                 let pending = crate::PendingChannelOpen {
                     recipient_channel: msg.recipient_channel,
                     sender_channel: id,
                     window_size: self.common.config.window_size,
                     packet_size: self.common.config.maximum_packet_size,
                     channel_ref,
-                    channel_params: Some(channel_params),
-                    channel_cleanup: None,
+                    channel_cleanup: Some(PendingChannelCleanup::new(id, self.receive_credit_sender.clone())),
                 };
                 let reply = ChannelOpenHandle::new(
                     self.priority_sender.clone(),

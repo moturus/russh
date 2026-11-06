@@ -1532,17 +1532,8 @@ impl Session {
                     self.drain_priority_msgs()?;
                 }
                 event = self.receive_credit_receiver.recv(), if !self.kex.active() => {
-                    match event {
-                        Some(ReceiveWindowEvent::Credit(channel)) => {
-                            self.flush_receive_credit(channel)?;
-                        }
-                        Some(ReceiveWindowEvent::AbandonedOpen(channel)) => {
-                            self.channels.remove(&channel);
-                            if let Some(encrypted) = self.common.encrypted.as_mut() {
-                                encrypted.channels.remove(&channel);
-                            }
-                        }
-                        None => {}
+                    if let Some(event) = event {
+                        self.handle_receive_window_event(event)?;
                     }
                 }
                 permit = crate::future_or_pending(
@@ -1644,6 +1635,19 @@ impl Session {
             match self.priority_receiver.try_recv() {
                 Ok(msg) => self.handle_msg(msg)?,
                 Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_receive_window_event(&mut self, event: ReceiveWindowEvent) -> Result<(), crate::Error> {
+        match event {
+            ReceiveWindowEvent::Credit(channel) => { self.flush_receive_credit(channel)?; }
+            ReceiveWindowEvent::AbandonedOpen(channel) => {
+                self.channels.remove(&channel);
+                if let Some(encrypted) = self.common.encrypted.as_mut() {
+                    encrypted.channels.remove(&channel);
+                }
             }
         }
         Ok(())
@@ -1866,12 +1870,19 @@ impl Session {
 
     fn finalize_server_channel_open_reply(
         &mut self,
-        pending: crate::PendingChannelOpen,
+        mut pending: crate::PendingChannelOpen,
         result: Result<(), ChannelOpenFailure>,
     ) -> Result<(), crate::Error> {
+        if let Some(cleanup) = pending.channel_cleanup.take() {
+            cleanup.disarm();
+        }
         if let Some(ref mut enc) = self.common.encrypted {
             match result {
                 Ok(()) => {
+                    let Some(channel_params) = enc.channels.get_mut(&pending.sender_channel) else {
+                        return Err(crate::Error::Inconsistent);
+                    };
+                    channel_params.confirmed = true;
                     push_packet!(enc.write, {
                         msg::CHANNEL_OPEN_CONFIRMATION.encode(&mut enc.write)?;
                         pending.recipient_channel.encode(&mut enc.write)?;
@@ -1879,14 +1890,11 @@ impl Session {
                         pending.window_size.encode(&mut enc.write)?;
                         pending.packet_size.encode(&mut enc.write)?;
                     });
-                    let Some(channel_params) = pending.channel_params else {
-                        return Err(crate::Error::Inconsistent);
-                    };
-                    enc.channels.insert(pending.sender_channel, channel_params);
                     self.channels
                         .insert(pending.sender_channel, pending.channel_ref);
                 }
                 Err(reason) => {
+                    enc.channels.remove(&pending.sender_channel);
                     push_packet!(enc.write, {
                         msg::CHANNEL_OPEN_FAILURE.encode(&mut enc.write)?;
                         pending.recipient_channel.encode(&mut enc.write)?;
@@ -2575,6 +2583,106 @@ mod tests {
             Channel::new(id, session.inbound_channel_sender.clone(), 128, 0, 8);
         session.channels.insert(id, reference);
         (id, channel)
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn incoming_client_credit_controls_the_first_window() {
+        let (mut session, mut handler, id) = incoming_credit_session().await;
+        let (mut channel, credit, reply) = handler.opened.take().unwrap();
+        assert!(!session.common.is_established_channel(id));
+        assert!(session.common.encrypted.as_ref().unwrap().write.is_empty());
+        reply.accept().await;
+        session.drain_priority_msgs().unwrap();
+        assert!(session.common.is_established_channel(id));
+        let confirmation = session.common.encrypted.as_ref().unwrap().write.clone();
+        for _ in 0..8 {
+            let mut packet = vec![msg::CHANNEL_DATA];
+            id.encode(&mut packet).unwrap();
+            vec![5u8; 1024].encode(&mut packet).unwrap();
+            session.process_packet(&mut handler, &packet).await.unwrap();
+        }
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert_eq!(enc.sender_window_size(id), 0);
+        assert_eq!(enc.write, confirmation);
+        for _ in 0..8 {
+            assert!(matches!(channel.wait().await, Some(ChannelMsg::Data { data }) if data.len() == 1024));
+        }
+        credit.consumed(8192);
+        assert!(session.flush_receive_credit(id).unwrap());
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn rejected_client_incoming_opens_release_credit_state() {
+        for explicit in [true, false] {
+            let (mut session, mut handler, id) = incoming_credit_session().await;
+            let (_channel, credit, reply) = handler.opened.take().unwrap();
+            if explicit { reply.reject(ChannelOpenFailure::ConnectFailed).await; } else { drop(reply); }
+            session.drain_priority_msgs().unwrap();
+            assert!(session.channels.is_empty());
+            assert!(session.common.encrypted.as_ref().unwrap().channels.is_empty());
+            let failure = session.common.encrypted.as_ref().unwrap().write.clone();
+            assert_eq!(failure[4], msg::CHANNEL_OPEN_FAILURE);
+            credit.consumed(8192);
+            assert!(!session.flush_receive_credit(id).unwrap());
+            assert_eq!(session.common.encrypted.as_ref().unwrap().write, failure);
+        }
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn abandoned_client_incoming_reply_cleans_registered_parameters() {
+        let (mut session, mut handler, id) = incoming_credit_session().await;
+        let (mut channel, _credit, reply) = handler.opened.take().unwrap();
+        drop(reply);
+        // Losing the queued reply also loses its cleanup guard, independently
+        // of whether that reply ever reaches the protocol dispatcher.
+        drop(session.priority_receiver.try_recv().unwrap());
+        let event = session.receive_credit_receiver.try_recv().unwrap();
+        assert!(matches!(event, ReceiveWindowEvent::AbandonedOpen(channel) if channel == id));
+        session.handle_receive_window_event(event).unwrap();
+        assert!(session.channels.is_empty());
+        assert!(session.common.encrypted.as_ref().unwrap().channels.is_empty());
+        assert!(channel.wait().await.is_none());
+    }
+
+    #[cfg(feature = "flate2")]
+    #[derive(Default)]
+    struct IncomingCredit {
+        opened: Option<(Channel<Msg>, crate::ReceiveCredit, ChannelOpenHandle)>,
+    }
+
+    #[cfg(feature = "flate2")]
+    impl Handler for IncomingCredit {
+        type Error = crate::Error;
+        async fn server_channel_open_forwarded_tcpip(
+            &mut self, channel: Channel<Msg>, _: &str, _: u32, _: &str, _: u32,
+            reply: ChannelOpenHandle, session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let credit = session.receive_credit(channel.id()).expect("incoming parameters before callback");
+            self.opened = Some((channel, credit, reply));
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "flate2")]
+    async fn incoming_credit_session() -> (Session, IncomingCredit, ChannelId) {
+        let mut session = authenticated_session();
+        Arc::get_mut(&mut session.common.config).unwrap().window_size = 8192;
+        let mut packet = vec![msg::CHANNEL_OPEN];
+        "forwarded-tcpip".encode(&mut packet).unwrap();
+        42u32.encode(&mut packet).unwrap();
+        8192u32.encode(&mut packet).unwrap();
+        1024u32.encode(&mut packet).unwrap();
+        "127.0.0.1".encode(&mut packet).unwrap();
+        22u32.encode(&mut packet).unwrap();
+        "127.0.0.1".encode(&mut packet).unwrap();
+        12345u32.encode(&mut packet).unwrap();
+        let mut handler = IncomingCredit::default();
+        session.process_packet(&mut handler, &packet).await.unwrap();
+        let id = handler.opened.as_ref().unwrap().0.id();
+        (session, handler, id)
     }
 
     #[cfg(feature = "flate2")]
