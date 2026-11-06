@@ -22,6 +22,7 @@ use ssh_encoding::{Decode, Encode, Reader};
 use ssh_key::{Algorithm, PublicKey, Signature};
 
 use super::IncomingSshPacket;
+use super::pending::Delivery;
 use crate::auth::AuthRequest;
 use crate::cert::PublicKeyOrCertificate;
 use crate::client::{ChannelOpenHandle, Handler, Msg, Prompt, Reply, Session};
@@ -482,6 +483,31 @@ impl Session {
         client: &mut H,
         buf: &[u8],
     ) -> Result<(), H::Error> {
+        self.client_read_authenticated_with_slot(client, buf, None).await
+    }
+
+    pub(super) async fn client_read_authenticated_with_slot<H: Handler>(
+        &mut self,
+        client: &mut H,
+        buf: &[u8],
+        delivery: Option<Delivery>,
+    ) -> Result<(), H::Error> {
+        let mut delivery = if let Some(delivery) = delivery {
+            delivery
+        } else if let Some((&kind, mut rest)) = buf.split_first()
+            && matches!(kind, msg::CHANNEL_OPEN_CONFIRMATION | msg::CHANNEL_OPEN_FAILURE
+                | msg::CHANNEL_DATA | msg::CHANNEL_EXTENDED_DATA | msg::CHANNEL_EOF
+                | msg::CHANNEL_CLOSE | msg::CHANNEL_REQUEST | msg::CHANNEL_SUCCESS
+                | msg::CHANNEL_FAILURE)
+        {
+            let channel = map_err!(ChannelId::decode(&mut rest))?;
+            let Some(delivery) = self.reserve_delivery(channel, buf) else {
+                return Ok(());
+            };
+            delivery
+        } else {
+            Delivery::Closed
+        };
         match buf.split_first() {
             Some((&msg::CHANNEL_OPEN_CONFIRMATION, mut reader)) => {
                 debug!("channel_open_confirmation");
@@ -500,18 +526,11 @@ impl Session {
                     return Err(crate::Error::Inconsistent.into());
                 };
 
-                if let Some(channel) = self.channels.get(&local_id) {
-                    channel
-                        .send(ChannelMsg::Open {
-                            id: local_id,
-                            max_packet_size: msg.maximum_packet_size,
-                            window_size: msg.initial_window_size,
-                        })
-                        .await
-                        .unwrap_or(());
-                } else {
-                    error!("no channel for id {local_id:?}");
-                }
+                delivery.send(ChannelMsg::Open {
+                    id: local_id,
+                    max_packet_size: msg.maximum_packet_size,
+                    window_size: msg.initial_window_size,
+                });
 
                 client
                     .channel_open_confirmation(
@@ -537,9 +556,7 @@ impl Session {
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
                 // `ChannelMsg::Close` instead of just seeing `None`.
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Close).await;
-                }
+                delivery.send(ChannelMsg::Close);
                 self.channels.remove(&channel_num);
                 client.channel_close(channel_num, self).await
             }
@@ -550,9 +567,7 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Eof).await;
-                }
+                delivery.send(ChannelMsg::Eof);
                 client.channel_eof(channel_num, self).await
             }
             Some((&msg::CHANNEL_OPEN_FAILURE, mut r)) => {
@@ -575,11 +590,8 @@ impl Session {
                     return Ok(());
                 }
 
-                if let Some(sender) = self.channels.remove(&channel_num) {
-                    let _ = sender
-                        .send(ChannelMsg::OpenFailure(reason_code.clone()))
-                        .await;
-                }
+                delivery.send(ChannelMsg::OpenFailure(reason_code.clone()));
+                self.channels.remove(&channel_num);
 
                 let _ = self.sender.send(Reply::ChannelOpenFailure);
 
@@ -619,9 +631,7 @@ impl Session {
                     Some(ext) => ChannelMsg::ExtendedData { ext, data: data.clone() },
                     None => ChannelMsg::Data { data: data.clone() },
                 };
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(message).await;
-                }
+                delivery.send(message);
                 self.replenish_receive_window(client, channel_num)?;
                 match ext {
                     Some(ext) => client.extended_data(channel_num, ext, &data, self).await,
@@ -640,18 +650,14 @@ impl Session {
                         map_err!(u8::decode(&mut r))?; // should be 0.
                         let client_can_do = map_err!(u8::decode(&mut r))? != 0;
                         map_err!(ensure_end(&r))?;
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan.send(ChannelMsg::XonXoff { client_can_do }).await;
-                        }
+                        delivery.send(ChannelMsg::XonXoff { client_can_do });
                         client.xon_xoff(channel_num, client_can_do, self).await
                     }
                     "exit-status" => {
                         map_err!(u8::decode(&mut r))?; // should be 0.
                         let exit_status = map_err!(u32::decode(&mut r))?;
                         map_err!(ensure_end(&r))?;
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan.send(ChannelMsg::ExitStatus { exit_status }).await;
-                        }
+                        delivery.send(ChannelMsg::ExitStatus { exit_status });
                         client.exit_status(channel_num, exit_status, self).await
                     }
                     "exit-signal" => {
@@ -662,16 +668,12 @@ impl Session {
                         let error_message = map_err!(String::decode(&mut r))?;
                         let lang_tag = map_err!(String::decode(&mut r))?;
                         map_err!(ensure_end(&r))?;
-                        if let Some(chan) = self.channels.get(&channel_num) {
-                            let _ = chan
-                                .send(ChannelMsg::ExitSignal {
-                                    signal_name: signal_name.clone(),
-                                    core_dumped,
-                                    error_message: error_message.to_string(),
-                                    lang_tag: lang_tag.to_string(),
-                                })
-                                .await;
-                        }
+                        delivery.send(ChannelMsg::ExitSignal {
+                            signal_name: signal_name.clone(),
+                            core_dumped,
+                            error_message: error_message.to_string(),
+                            lang_tag: lang_tag.to_string(),
+                        });
                         client
                             .exit_signal(
                                 channel_num,
@@ -799,9 +801,7 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Success).await;
-                }
+                delivery.send(ChannelMsg::Success);
                 client.channel_success(channel_num, self).await
             }
             Some((&msg::CHANNEL_FAILURE, mut r)) => {
@@ -810,9 +810,7 @@ impl Session {
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Failure).await;
-                }
+                delivery.send(ChannelMsg::Failure);
                 client.channel_failure(channel_num, self).await
             }
             Some((&msg::CHANNEL_OPEN, mut r)) => {

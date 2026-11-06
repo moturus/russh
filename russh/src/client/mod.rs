@@ -76,6 +76,7 @@ use crate::{
 
 mod encrypted;
 mod kex;
+mod pending;
 mod session;
 
 #[cfg(test)]
@@ -102,6 +103,7 @@ pub struct Session {
     inbound_channel_receiver: Receiver<Msg>,
     receive_credit_sender: UnboundedSender<ReceiveWindowEvent>,
     receive_credit_receiver: UnboundedReceiver<ReceiveWindowEvent>,
+    pending_channel_packet: Option<pending::PendingChannelPacket>,
     open_global_requests: VecDeque<GlobalRequestResponse>,
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
@@ -1335,6 +1337,7 @@ impl Session {
             inbound_channel_receiver,
             receive_credit_sender,
             receive_credit_receiver,
+            pending_channel_packet: None,
             channels: HashMap::new(),
             pending_reads: Vec::new(),
             pending_len: 0,
@@ -1433,11 +1436,12 @@ impl Session {
             // application output in its bounded receivers while a channel is
             // window-blocked.
             let can_receive_outbound = !self.kex.active() && !self.common.has_any_pending_data();
+            let has_pending_channel_packet = self.pending_channel_packet.is_some();
             let rekey_timer =
                 crate::future_or_pending(self.rekey_time_remaining(), tokio::time::sleep);
             pin!(rekey_timer);
             tokio::select! {
-                r = &mut reading => {
+                r = &mut reading, if !has_pending_channel_packet => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
                         Err(e) => return Err(e.into())
@@ -1540,6 +1544,11 @@ impl Session {
                         }
                         None => {}
                     }
+                }
+                permit = crate::future_or_pending(
+                    self.pending_channel_packet.as_mut(), |pending| pending.permit.as_mut(),
+                ), if has_pending_channel_packet => {
+                    self.complete_channel_packet(handler, permit).await?;
                 }
                 msg = self.inbound_channel_receiver.recv(), if can_receive_outbound => {
                     self.drain_priority_msgs()?;
@@ -2566,6 +2575,77 @@ mod tests {
             Channel::new(id, session.inbound_channel_sender.clone(), 128, 0, 8);
         session.channels.insert(id, reference);
         (id, channel)
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn saturated_client_input_keeps_outbound_data_moving() {
+        let (mut session, id, _received) = client_with_parked_packet(msg::CHANNEL_DATA).await;
+        session.common.encrypted.as_mut().unwrap().channels.get_mut(&id).unwrap()
+            .recipient_window_size = 1024;
+        let (sender, receiver) = channel(1);
+        session.receiver = receiver;
+        sender.send(Msg::Channel(id, ChannelMsg::Data {
+            data: bytes::Bytes::from_static(b"out"),
+        })).await.unwrap();
+        let (mut peer, stream) = tokio::io::duplex(64 * 1024);
+        assert_eq!(first_packet_from_event_loop(session, &mut peer, stream).await, Some(msg::CHANNEL_DATA));
+        drop(sender);
+    }
+
+    #[cfg(feature = "flate2")]
+    async fn client_with_parked_packet(kind: u8) -> (Session, ChannelId, Channel<Msg>) {
+        let mut session = authenticated_session();
+        Arc::get_mut(&mut session.common.config).unwrap().window_size = 1024;
+        let (id, received) = close_test_channel(&mut session, true);
+        for _ in 0..8 {
+            session.channels[&id].try_send(ChannelMsg::Success).unwrap();
+        }
+        let mut packet = vec![kind];
+        id.encode(&mut packet).unwrap();
+        if kind == msg::CHANNEL_DATA {
+            b"in".as_slice().encode(&mut packet).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), session.process_packet(&mut TestHandler, &packet))
+            .await.unwrap().unwrap();
+        assert!(session.pending_channel_packet.is_some());
+        (session, id, received)
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn saturated_client_packets_resume_in_order_after_drain() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for kind in [msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE] {
+                let (mut session, _, mut received) = client_with_parked_packet(kind).await;
+                assert!(matches!(received.wait().await, Some(ChannelMsg::Success)));
+                let permit = session.pending_channel_packet.as_mut().unwrap().permit.as_mut().await;
+                session.complete_channel_packet(&mut TestHandler, permit).await.unwrap();
+                assert!(session.pending_channel_packet.is_none());
+                for _ in 0..7 {
+                    assert!(matches!(received.wait().await, Some(ChannelMsg::Success)));
+                }
+                match (kind, received.wait().await) {
+                    (msg::CHANNEL_DATA, Some(ChannelMsg::Data { data })) => assert_eq!(data.as_ref(), b"in"),
+                    (msg::CHANNEL_EOF, Some(ChannelMsg::Eof)) | (msg::CHANNEL_CLOSE, Some(ChannelMsg::Close)) => {}
+                    other => panic!("wrong deferred packet: {other:?}"),
+                }
+            }
+        }).await.unwrap();
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn local_client_close_drops_parked_packet_without_acknowledgement() {
+        let (mut session, id, mut received) = client_with_parked_packet(msg::CHANNEL_DATA).await;
+        session.close(id).unwrap();
+        assert!(session.pending_channel_packet.is_none());
+        assert!(!session.channels.contains_key(&id));
+        assert!(!session.common.encrypted.as_ref().unwrap().channels.contains_key(&id));
+        for _ in 0..8 {
+            assert!(matches!(received.wait().await, Some(ChannelMsg::Success)));
+        }
+        assert!(matches!(tokio::task::unconstrained(received.wait()).now_or_never(), Some(None)));
     }
 
     #[cfg(feature = "flate2")]
