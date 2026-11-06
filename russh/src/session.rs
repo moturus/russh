@@ -316,39 +316,6 @@ impl Encrypted {
         }
     }
 
-    pub fn adjust_window_size(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        target: u32,
-    ) -> Result<bool, crate::Error> {
-        if let Some(channel) = self.channels.get_mut(&channel) {
-            trace!(
-                "adjust_window_size, channel = {}, size = {},",
-                channel.sender_channel, target
-            );
-            // Ignore extra data.
-            // https://tools.ietf.org/html/rfc4254#section-5.2
-            if data.len() as u32 <= channel.sender_window_size {
-                channel.sender_window_size -= data.len() as u32;
-            }
-            if channel.sender_window_size < target / 2 {
-                debug!(
-                    "sender_window_size {:?}, target {:?}",
-                    channel.sender_window_size, target
-                );
-                push_packet!(self.write, {
-                    self.write.push(msg::CHANNEL_WINDOW_ADJUST);
-                    channel.recipient_channel.encode(&mut self.write)?;
-                    (target - channel.sender_window_size).encode(&mut self.write)?;
-                });
-                channel.sender_window_size = target;
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Spend receive-window credit for an incoming channel-data packet.
     ///
     /// OpenSSH gives ordinary data a small compatibility grace when a peer

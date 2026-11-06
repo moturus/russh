@@ -4,9 +4,47 @@ use tokio::sync::oneshot;
 
 use crate::client::Session;
 use crate::session::EncryptedState;
-use crate::{ChannelId, CryptoVec, Disconnect, Pty, Sig, map_err, msg};
+use crate::{ChannelId, CryptoVec, Disconnect, Pty, ReceiveCredit, Sig, map_err, msg};
 
 impl Session {
+    /// Put a registered channel's receive window under application control.
+    ///
+    /// Call this from the open-confirmation callback to control the first data
+    /// packet. Credit is returned only as this handle reports consumption.
+    /// Repeated calls share accounting; dropping the last restores automatic mode.
+    pub fn receive_credit(&mut self, channel: ChannelId) -> Option<ReceiveCredit> {
+        let params = self.common.encrypted.as_mut()?.channels.get_mut(&channel)?;
+        Some(ReceiveCredit::new(params.application_receive_credit(
+            self.receive_credit_sender.clone(),
+        )))
+    }
+
+    pub(super) fn flush_receive_credit(&mut self, channel: ChannelId) -> Result<bool, crate::Error> {
+        match self.common.encrypted.as_mut() {
+            Some(enc) => enc.flush_receive_credit(channel, self.common.config.window_size),
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) fn replenish_receive_window<H: super::Handler>(
+        &mut self,
+        handler: &mut H,
+        channel: ChannelId,
+    ) -> Result<(), crate::Error> {
+        if let Some(enc) = self.common.encrypted.as_mut() {
+            // Preserve the client's configured automatic window and callback policy.
+            let target = self.common.config.window_size;
+            if enc.refill_receive_window(channel, target)? {
+                let next = handler.adjust_window(channel, self.target_window_size);
+                if next > 0 {
+                    self.target_window_size = next;
+                }
+            }
+            enc.flush_receive_credit(channel, target)?;
+        }
+        Ok(())
+    }
+
     fn channel_open_generic<F>(
         &mut self,
         kind: &[u8],

@@ -69,7 +69,8 @@ use crate::session::{CommonSession, EncryptedState, GlobalRequestResponse, NewKe
 use crate::ssh_read::SshRead;
 use crate::sshbuffer::{IncomingSshPacket, PacketWriter, SSHBuffer, SshId};
 use crate::{
-    ChannelId, ChannelOpenFailure, CryptoVec, Disconnect, Error, Limits, MethodSet, Sig, auth,
+    ChannelId, ChannelOpenFailure, CryptoVec, Disconnect, Error, Limits, MethodSet,
+    ReceiveWindowEvent, Sig, auth,
     map_err, msg, negotiation,
 };
 
@@ -99,6 +100,8 @@ pub struct Session {
     priority_receiver: UnboundedReceiver<Msg>,
     inbound_channel_sender: Sender<Msg>,
     inbound_channel_receiver: Receiver<Msg>,
+    receive_credit_sender: UnboundedSender<ReceiveWindowEvent>,
+    receive_credit_receiver: UnboundedReceiver<ReceiveWindowEvent>,
     open_global_requests: VecDeque<GlobalRequestResponse>,
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
@@ -1319,6 +1322,7 @@ impl Session {
     ) -> Self {
         let (priority_sender, priority_receiver) = unbounded_channel();
         let (inbound_channel_sender, inbound_channel_receiver) = channel(10);
+        let (receive_credit_sender, receive_credit_receiver) = unbounded_channel();
         Self {
             common,
             receiver,
@@ -1329,6 +1333,8 @@ impl Session {
             priority_receiver,
             inbound_channel_sender,
             inbound_channel_receiver,
+            receive_credit_sender,
+            receive_credit_receiver,
             channels: HashMap::new(),
             pending_reads: Vec::new(),
             pending_len: 0,
@@ -1520,6 +1526,20 @@ impl Session {
 
                     // eagerly take all outgoing messages so writes are batched
                     self.drain_priority_msgs()?;
+                }
+                event = self.receive_credit_receiver.recv(), if !self.kex.active() => {
+                    match event {
+                        Some(ReceiveWindowEvent::Credit(channel)) => {
+                            self.flush_receive_credit(channel)?;
+                        }
+                        Some(ReceiveWindowEvent::AbandonedOpen(channel)) => {
+                            self.channels.remove(&channel);
+                            if let Some(encrypted) = self.common.encrypted.as_mut() {
+                                encrypted.channels.remove(&channel);
+                            }
+                        }
+                        None => {}
+                    }
                 }
                 msg = self.inbound_channel_receiver.recv(), if can_receive_outbound => {
                     self.drain_priority_msgs()?;

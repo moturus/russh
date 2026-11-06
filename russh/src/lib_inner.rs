@@ -558,7 +558,8 @@ impl ReceiveCreditState {
 
 /// Returns receive-window credit as an application consumes channel data.
 ///
-/// Obtain this from [`server::Session::receive_credit`]. Dropping the last
+/// Obtain this from [`server::Session::receive_credit`] or
+/// [`client::Session::receive_credit`]. Dropping the last
 /// handle restores automatic window replenishment.
 #[derive(Debug)]
 pub struct ReceiveCredit {

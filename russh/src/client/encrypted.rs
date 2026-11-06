@@ -28,7 +28,7 @@ use crate::client::{ChannelOpenHandle, Handler, Msg, Prompt, Reply, Session};
 use crate::helpers::{AlgorithmExt, EncodedExt, NameList, sign_with_hash_alg};
 use crate::keys::key::parse_public_key;
 use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage, ensure_end};
-use crate::session::{Encrypted, EncryptedState, GlobalRequestResponse};
+use crate::session::{Encrypted, EncryptedState, GlobalRequestResponse, ReceiveWindowState};
 use crate::{
     Channel, ChannelId, ChannelMsg, ChannelOpenFailure, ChannelParams, CryptoVec, Error, MethodSet,
     Sig, auth, map_err, msg,
@@ -587,65 +587,46 @@ impl Session {
                     .channel_open_failure(channel_num, reason_code, &descr, &language, self)
                     .await
             }
-            Some((&msg::CHANNEL_DATA, mut r)) => {
-                trace!("channel_data");
+            Some((&kind, mut r))
+                if matches!(kind, msg::CHANNEL_DATA | msg::CHANNEL_EXTENDED_DATA) =>
+            {
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
+                let ext = if kind == msg::CHANNEL_EXTENDED_DATA {
+                    Some(map_err!(u32::decode(&mut r))?)
+                } else {
+                    None
+                };
                 let data = map_err!(Bytes::decode(&mut r))?;
                 map_err!(ensure_end(&r))?;
                 if !self.common.is_established_channel(channel_num) {
                     return Ok(());
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
                 if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
+                    match enc.consume_receive_window(channel_num, data.len(), ext.is_some()) {
+                        ReceiveWindowState::Accepted => {}
+                        ReceiveWindowState::Discarded => return Ok(()),
+                        ReceiveWindowState::ProtocolError => {
+                            self.common.disconnect(
+                                crate::Disconnect::ProtocolError,
+                                "invalid channel data window",
+                                "",
+                            )?;
+                            return Ok(());
                         }
                     }
                 }
-
+                let message = match ext {
+                    Some(ext) => ChannelMsg::ExtendedData { ext, data: data.clone() },
+                    None => ChannelMsg::Data { data: data.clone() },
+                };
                 if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan.send(ChannelMsg::Data { data: data.clone() }).await;
+                    let _ = chan.send(message).await;
                 }
-
-                client.data(channel_num, &data, self).await
-            }
-            Some((&msg::CHANNEL_EXTENDED_DATA, mut r)) => {
-                debug!("channel_extended_data");
-                let channel_num = map_err!(ChannelId::decode(&mut r))?;
-                let extended_code = map_err!(u32::decode(&mut r))?;
-                let data = map_err!(Bytes::decode(&mut r))?;
-                map_err!(ensure_end(&r))?;
-                if !self.common.is_established_channel(channel_num) {
-                    return Ok(());
+                self.replenish_receive_window(client, channel_num)?;
+                match ext {
+                    Some(ext) => client.extended_data(channel_num, ext, &data, self).await,
+                    None => client.data(channel_num, &data, self).await,
                 }
-                let target = self.common.config.window_size;
-                #[allow(clippy::collapsible_if)]
-                if let Some(ref mut enc) = self.common.encrypted {
-                    if enc.adjust_window_size(channel_num, &data, target)? {
-                        let next_window =
-                            client.adjust_window(channel_num, self.target_window_size);
-                        if next_window > 0 {
-                            self.target_window_size = next_window
-                        }
-                    }
-                }
-
-                if let Some(chan) = self.channels.get(&channel_num) {
-                    let _ = chan
-                        .send(ChannelMsg::ExtendedData {
-                            ext: extended_code,
-                            data: data.clone(),
-                        })
-                        .await;
-                }
-
-                client
-                    .extended_data(channel_num, extended_code, &data, self)
-                    .await
             }
             Some((&msg::CHANNEL_REQUEST, mut r)) => {
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
