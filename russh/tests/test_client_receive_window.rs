@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use russh::{Channel, ChannelId, ChannelMsg, ReceiveCredit, client, server};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
 const WINDOW: u32 = 8192;
@@ -9,6 +9,7 @@ const WINDOW: u32 = 8192;
 #[derive(Clone, Copy)]
 enum Mode {
     Consume,
+    Rekey,
     Release,
     Automatic,
 }
@@ -16,6 +17,8 @@ enum Mode {
 struct Client {
     manual: bool,
     credits: mpsc::UnboundedSender<Option<ReceiveCredit>>,
+    exchanges: usize,
+    rekey: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 impl client::Handler for Client {
@@ -37,6 +40,22 @@ impl client::Handler for Client {
     ) -> Result<(), Self::Error> {
         let credit = self.manual.then(|| session.receive_credit(id).unwrap());
         self.credits.send(credit).unwrap();
+        Ok(())
+    }
+
+    async fn kex_done(
+        &mut self,
+        _: Option<&[u8]>,
+        _: &russh::Names,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.exchanges += 1;
+        if self.exchanges == 2
+            && let Some((started, resume)) = self.rekey.take()
+        {
+            started.send(()).unwrap();
+            resume.await.unwrap();
+        }
         Ok(())
     }
 }
@@ -93,6 +112,8 @@ async fn transfer(mode: Mode) -> anyhow::Result<()> {
             Server(opened_tx),
         ));
         let (credits_tx, mut credits) = mpsc::unbounded_channel();
+        let (rekey_started, rekeying) = oneshot::channel();
+        let (resume, resuming) = oneshot::channel();
         let mut client = client::connect_stream(
             Arc::new(client::Config {
                 window_size: WINDOW,
@@ -104,6 +125,8 @@ async fn transfer(mode: Mode) -> anyhow::Result<()> {
             Client {
                 manual: !matches!(mode, Mode::Automatic),
                 credits: credits_tx,
+                exchanges: 0,
+                rekey: matches!(mode, Mode::Rekey).then_some((rekey_started, resuming)),
             },
         )
         .await?;
@@ -122,20 +145,29 @@ async fn transfer(mode: Mode) -> anyhow::Result<()> {
         } else {
             assert_eq!(remote.writable_packet_size().await, 0);
         }
+        if matches!(mode, Mode::Rekey) {
+            client.rekey_soon().await?;
+            rekeying.await.unwrap();
+        }
         match mode {
-            Mode::Consume => {
+            Mode::Consume | Mode::Rekey => {
                 let credit = credit.as_ref().unwrap();
                 credit.consumed(WINDOW / 2);
                 credit.consumed(WINDOW / 2);
             }
             Mode::Release | Mode::Automatic => drop(credit.take()),
         }
+        if matches!(mode, Mode::Rekey) {
+            // The report was queued while key exchange still owned the session.
+            // Resuming must flush it without another application message.
+            resume.send(()).unwrap();
+        }
         let (sent, ()) = tokio::join!(
             remote.data_bytes(vec![0x5a; WINDOW as usize]),
             read_window(&mut channel),
         );
         sent?;
-        if matches!(mode, Mode::Consume) {
+        if matches!(mode, Mode::Consume | Mode::Rekey) {
             assert_eq!(remote.writable_packet_size().await, 0);
         }
         remote.eof().await?;
@@ -167,6 +199,11 @@ async fn transfer(mode: Mode) -> anyhow::Result<()> {
 #[tokio::test]
 async fn client_credit_waits_for_consumption_and_wakes_the_sender() -> anyhow::Result<()> {
     transfer(Mode::Consume).await
+}
+
+#[tokio::test]
+async fn client_credit_reported_during_rekey_wakes_the_sender() -> anyhow::Result<()> {
+    transfer(Mode::Rekey).await
 }
 
 #[tokio::test]
