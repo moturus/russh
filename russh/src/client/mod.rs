@@ -76,8 +76,12 @@ use crate::{
 
 mod encrypted;
 mod kex;
+mod open;
 mod pending;
 mod session;
+
+#[doc(hidden)]
+pub use open::PendingChannelCredit;
 
 #[cfg(test)]
 mod test;
@@ -195,6 +199,17 @@ pub enum Msg {
         originator_port: u32,
         channel_ref: ChannelRef,
     },
+    #[doc(hidden)]
+    ChannelOpenDirectTcpIpWithCredit {
+        host_to_connect: String,
+        port_to_connect: u32,
+        originator_address: String,
+        originator_port: u32,
+        channel_ref: ChannelRef,
+        credit: oneshot::Sender<PendingChannelCredit>,
+    },
+    #[doc(hidden)]
+    AbandonChannelOpen { id: ChannelId },
     ChannelOpenDirectStreamLocal {
         socket_path: String,
         channel_ref: ChannelRef,
@@ -1709,6 +1724,23 @@ impl Session {
                 let id = self.channel_open_direct_streamlocal(&socket_path)?;
                 self.channels.insert(id, channel_ref);
             }
+            Msg::ChannelOpenDirectTcpIpWithCredit {
+                host_to_connect, port_to_connect, originator_address, originator_port,
+                channel_ref, credit,
+            } => {
+                if channel_ref.is_closed() || credit.is_closed() {
+                    return Ok(());
+                }
+                let id = self.channel_open_direct_tcpip(
+                    &host_to_connect, port_to_connect, &originator_address, originator_port,
+                )?;
+                let receive_credit = self.receive_credit(id).ok_or(Error::Inconsistent)?;
+                self.channels.insert(id, channel_ref);
+                drop(credit.send(PendingChannelCredit::new(
+                    id, self.priority_sender.clone(), receive_credit,
+                )));
+            }
+            Msg::AbandonChannelOpen { id } => self.abandon_channel_open(id)?,
             Msg::TcpIpForward {
                 reply_channel,
                 address,
@@ -2610,6 +2642,98 @@ mod tests {
         }
         credit.consumed(8192);
         assert!(session.flush_receive_credit(id).unwrap());
+    }
+
+    #[cfg(feature = "flate2")]
+    fn manual_open_message() -> (Msg, Receiver<ChannelMsg>, oneshot::Receiver<PendingChannelCredit>) {
+        let (sender, receiver) = channel(1);
+        let (credit, handoff) = oneshot::channel();
+        (Msg::ChannelOpenDirectTcpIpWithCredit {
+            host_to_connect: "localhost".into(), port_to_connect: 80,
+            originator_address: "localhost".into(), originator_port: 1234,
+            channel_ref: ChannelRef::new(sender), credit,
+        }, receiver, handoff)
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn canceled_manual_open_before_dispatch_sends_nothing() {
+        for drop_handoff in [false, true] {
+            let mut session = authenticated_session();
+            let (message, receiver, handoff) = manual_open_message();
+            let mut receiver = Some(receiver);
+            let mut handoff = Some(handoff);
+            if drop_handoff { drop(handoff.take()); } else { drop(receiver.take()); }
+            session.handle_msg(message).unwrap();
+            assert!(session.channels.is_empty());
+            let enc = session.common.encrypted.as_ref().unwrap();
+            assert!(enc.channels.is_empty());
+            assert!(enc.write.is_empty());
+        }
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn canceled_manual_open_retains_only_protocol_state_until_reply() {
+        for confirmed in [false, true] {
+            let mut session = authenticated_session();
+            let (message, receiver, handoff) = manual_open_message();
+            session.handle_msg(message).unwrap();
+            let id = *session.channels.keys().next().unwrap();
+            drop(receiver);
+            drop(handoff); // Includes the guard queued before its receiver was polled.
+            session.drain_priority_msgs().unwrap();
+            assert!(session.channels.is_empty());
+            let enc = session.common.encrypted.as_mut().unwrap();
+            let parameters = &enc.channels[&id];
+            assert!(!parameters.confirmed);
+            assert!(parameters.application_consumed.is_none());
+            assert!(parameters.pending_data.is_empty());
+            enc.write.clear();
+            let mut packet = vec![if confirmed { msg::CHANNEL_OPEN_CONFIRMATION } else { msg::CHANNEL_OPEN_FAILURE }];
+            id.encode(&mut packet).unwrap();
+            if confirmed {
+                for value in [42u32, 1024, 128] { value.encode(&mut packet).unwrap(); }
+            } else {
+                2u32.encode(&mut packet).unwrap();
+                "refused".encode(&mut packet).unwrap();
+                "".encode(&mut packet).unwrap();
+            }
+            session.process_packet(&mut TestHandler, &packet).await.unwrap();
+            let enc = session.common.encrypted.as_ref().unwrap();
+            assert!(enc.channels.is_empty());
+            if confirmed {
+                assert_eq!(enc.write[4], msg::CHANNEL_CLOSE);
+                assert_eq!(&enc.write[5..9], &42u32.to_be_bytes());
+                // A second, genuinely unmatched confirmation is still an error.
+                assert!(matches!(session.process_packet(&mut TestHandler, &packet).await, Err(Error::Inconsistent)));
+            } else {
+                assert!(enc.write.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn canceled_confirmed_manual_open_releases_a_parked_packet() {
+        let mut session = authenticated_session();
+        let (message, receiver, handoff) = manual_open_message();
+        session.handle_msg(message).unwrap();
+        let id = *session.channels.keys().next().unwrap();
+        let mut confirmation = vec![msg::CHANNEL_OPEN_CONFIRMATION];
+        for value in [u32::from(id), 42, 1024, 128] { value.encode(&mut confirmation).unwrap(); }
+        session.process_packet(&mut TestHandler, &confirmation).await.unwrap();
+        let mut data = vec![msg::CHANNEL_DATA];
+        id.encode(&mut data).unwrap();
+        b"unread".as_slice().encode(&mut data).unwrap();
+        session.process_packet(&mut TestHandler, &data).await.unwrap();
+        assert!(session.pending_channel_packet.is_some());
+        drop(receiver);
+        drop(handoff);
+        session.drain_priority_msgs().unwrap();
+        assert!(session.pending_channel_packet.is_none());
+        assert!(session.channels.is_empty());
+        assert!(session.common.encrypted.as_ref().unwrap().channels.is_empty());
     }
 
     #[cfg(feature = "flate2")]

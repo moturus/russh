@@ -526,6 +526,13 @@ impl Session {
                     return Err(crate::Error::Inconsistent.into());
                 };
 
+                // Cancellation keeps an opening protocol record for this reply,
+                // but never exposes the late success to the application.
+                if !self.channels.get(&local_id).is_some_and(|channel| !channel.is_closed()) {
+                    self.close(local_id)?;
+                    return Ok(());
+                }
+
                 delivery.send(ChannelMsg::Open {
                     id: local_id,
                     max_packet_size: msg.maximum_packet_size,
