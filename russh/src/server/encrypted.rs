@@ -1567,9 +1567,10 @@ impl Session {
                 map_err!(ensure_end(r))?;
                 let local_id = ChannelId(msg.recipient_channel);
 
-                if let Some(ref mut enc) = self.common.encrypted {
+                let abandoned = if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
                         parameters.confirm(&msg);
+                        parameters.open_abandoned
                     } else {
                         // We've not requested this channel, close connection.
                         return Err(Error::Inconsistent.into());
@@ -1578,6 +1579,10 @@ impl Session {
                     return Err(Error::Inconsistent.into());
                 };
 
+                if abandoned || self.channels.get(&local_id).is_some_and(|channel| channel.is_closed()) {
+                    self.close(local_id)?;
+                    return Ok(());
+                }
                 if let Some(channel) = self.channels.get(&local_id) {
                     channel
                         .send(ChannelMsg::Open {
@@ -1587,8 +1592,6 @@ impl Session {
                         })
                         .await
                         .unwrap_or(());
-                } else {
-                    error!("no channel for id {local_id:?}");
                 }
                 handler
                     .channel_open_confirmation(
@@ -1948,10 +1951,7 @@ impl Session {
                 }
 
                 if let Some(channel_sender) = self.channels.remove(&channel_num) {
-                    channel_sender
-                        .send(ChannelMsg::OpenFailure(reason))
-                        .await
-                        .map_err(|_| crate::Error::SendError)?;
+                    let _ = channel_sender.send(ChannelMsg::OpenFailure(reason)).await;
                 }
 
                 Ok(())

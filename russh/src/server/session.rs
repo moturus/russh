@@ -105,6 +105,17 @@ pub enum Msg {
         originator_port: u32,
         channel_ref: ChannelRef,
     },
+    #[doc(hidden)]
+    ChannelOpenForwardedTcpIpWithCredit {
+        connected_address: String,
+        connected_port: u32,
+        originator_address: String,
+        originator_port: u32,
+        channel_ref: ChannelRef,
+        credit: oneshot::Sender<PendingChannelCredit>,
+    },
+    #[doc(hidden)]
+    AbandonChannelOpen { id: ChannelId },
     ChannelOpenForwardedStreamLocal {
         server_socket_path: String,
         channel_ref: ChannelRef,
@@ -145,6 +156,9 @@ impl From<(ChannelId, ChannelMsg)> for Msg {
 }
 
 pub use crate::PendingChannelOpen;
+
+#[doc(hidden)]
+pub type PendingChannelCredit = crate::channels::PendingChannelCredit<Msg>;
 
 /// A handle passed to channel-open callbacks that the handler uses to
 /// accept or reject the incoming channel request.
@@ -401,6 +415,39 @@ impl Handle {
             .await
     }
 
+    /// Open a forwarding channel with receive credit controlled by the caller.
+    ///
+    /// Manual accounting governs the first data packet, even if this future is
+    /// not polled again after confirmation. Cancellation releases application
+    /// state immediately; a pending protocol record lasts until the peer replies
+    /// or disconnects, and a late success is closed.
+    pub async fn channel_open_forwarded_tcpip_with_credit<A: Into<String>, B: Into<String>>(
+        &self,
+        connected_address: A,
+        connected_port: u32,
+        originator_address: B,
+        originator_port: u32,
+    ) -> Result<(Channel<Msg>, ReceiveCredit), Error> {
+        let (sender, receiver) = channel(self.channel_buffer_size);
+        let channel_ref = ChannelRef::new(sender);
+        let window = channel_ref.window_size().clone();
+        let (credit, handoff) = oneshot::channel();
+        self.sender
+            .send(Msg::ChannelOpenForwardedTcpIpWithCredit {
+                connected_address: connected_address.into(),
+                connected_port,
+                originator_address: originator_address.into(),
+                originator_port,
+                channel_ref,
+                credit,
+            })
+            .await
+            .map_err(|_| Error::SendError)?;
+        let handoff = handoff.await.map_err(|_| Error::Disconnect)?;
+        let channel = self.wait_channel_confirmation(receiver, window).await?;
+        Ok((channel, handoff.finish()))
+    }
+
     pub async fn channel_open_forwarded_streamlocal<A: Into<String>>(
         &self,
         server_socket_path: A,
@@ -628,6 +675,35 @@ impl Session {
                 )?;
                 self.channels.insert(id, channel_ref);
             }
+            Msg::ChannelOpenForwardedTcpIpWithCredit {
+                connected_address,
+                connected_port,
+                originator_address,
+                originator_port,
+                channel_ref,
+                credit,
+            } => {
+                if channel_ref.is_closed() || credit.is_closed() {
+                    return Ok(());
+                }
+                let id = self.channel_open_forwarded_tcpip(
+                    &connected_address,
+                    connected_port,
+                    &originator_address,
+                    originator_port,
+                )?;
+                let receive_credit = self.receive_credit(id).ok_or(Error::Inconsistent)?;
+                self.channels.insert(id, channel_ref);
+                let handoff = PendingChannelCredit::new(
+                    id,
+                    self.sender.priority_sender.clone(),
+                    receive_credit,
+                    |id| Msg::AbandonChannelOpen { id },
+                );
+                // A queued, unpolled handoff still owns cancellation cleanup.
+                let _ = credit.send(handoff);
+            }
+            Msg::AbandonChannelOpen { id } => self.abandon_channel_open(id)?,
             Msg::ChannelOpenForwardedStreamLocal {
                 server_socket_path,
                 channel_ref,
@@ -675,6 +751,22 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn abandon_channel_open(&mut self, id: ChannelId) -> Result<(), Error> {
+        self.channels.remove(&id);
+        if self.pending_channel_data.as_ref().is_some_and(|pending| pending.channel == id) {
+            self.pending_channel_data = None;
+        }
+        let Some(parameters) = self.common.encrypted.as_mut()
+            .and_then(|enc| enc.channels.get_mut(&id)) else { return Ok(()); };
+        if parameters.confirmed {
+            self.close(id)
+        } else {
+            parameters.open_abandoned = true;
+            parameters.application_consumed = None;
+            Ok(())
+        }
     }
 
     /// Put a channel's receive window under application control.
@@ -1832,6 +1924,141 @@ mod tests {
             open_global_requests: VecDeque::new(),
             kex: SessionKexState::Idle,
         }
+    }
+
+    fn manual_open_message() -> (Msg, Receiver<ChannelMsg>, oneshot::Receiver<PendingChannelCredit>) {
+        let (sender, receiver) = channel(1);
+        let (credit, handoff) = oneshot::channel();
+        (Msg::ChannelOpenForwardedTcpIpWithCredit {
+            connected_address: "localhost".into(), connected_port: 80,
+            originator_address: "localhost".into(), originator_port: 1234,
+            channel_ref: ChannelRef::new(sender), credit,
+        }, receiver, handoff)
+    }
+
+    fn open_reply(id: ChannelId, confirmed: bool) -> Vec<u8> {
+        let mut packet = vec![if confirmed { msg::CHANNEL_OPEN_CONFIRMATION } else { msg::CHANNEL_OPEN_FAILURE }];
+        id.encode(&mut packet).unwrap();
+        if confirmed {
+            for value in [42u32, 1024, 128] { value.encode(&mut packet).unwrap(); }
+        } else {
+            2u32.encode(&mut packet).unwrap();
+            "refused".encode(&mut packet).unwrap();
+            "".encode(&mut packet).unwrap();
+        }
+        packet
+    }
+
+    #[tokio::test]
+    async fn canceled_manual_open_before_dispatch_sends_nothing() {
+        for drop_handoff in [false, true] {
+            let mut session = authenticated_session();
+            let (message, receiver, handoff) = manual_open_message();
+            let mut receiver = Some(receiver);
+            let mut handoff = Some(handoff);
+            if drop_handoff { drop(handoff.take()); } else { drop(receiver.take()); }
+            session.dispatch_msg(message).unwrap();
+            assert!(session.channels.is_empty());
+            let enc = session.common.encrypted.as_ref().unwrap();
+            assert!(enc.channels.is_empty());
+            assert!(enc.write.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_manual_open_retains_only_protocol_state_until_reply() {
+        for confirmed in [false, true] {
+            let mut session = authenticated_session();
+            let (message, receiver, handoff) = manual_open_message();
+            session.dispatch_msg(message).unwrap();
+            let id = *session.channels.keys().next().unwrap();
+            drop(receiver);
+            drop(handoff);
+            let cleanup = session.priority_receiver.try_recv().unwrap();
+            session.dispatch_msg(cleanup).unwrap();
+            assert!(session.channels.is_empty());
+            let enc = session.common.encrypted.as_mut().unwrap();
+            assert!(enc.channels[&id].open_abandoned);
+            assert!(enc.channels[&id].application_consumed.is_none());
+            assert!(enc.channels[&id].pending_data.is_empty());
+            enc.write.clear();
+            let packet = open_reply(id, confirmed);
+            session.process_packet(&mut TestHandler, &packet).await.unwrap();
+            let enc = session.common.encrypted.as_ref().unwrap();
+            assert!(enc.channels.is_empty());
+            if confirmed {
+                assert_eq!(enc.write[4], msg::CHANNEL_CLOSE);
+                assert_eq!(&enc.write[5..9], &42u32.to_be_bytes());
+                assert!(matches!(session.process_packet(&mut TestHandler, &packet).await, Err(Error::Inconsistent)));
+            } else {
+                assert!(enc.write.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_confirmed_manual_open_releases_a_parked_packet() {
+        let mut session = authenticated_session();
+        let (message, receiver, handoff) = manual_open_message();
+        session.dispatch_msg(message).unwrap();
+        let id = *session.channels.keys().next().unwrap();
+        session.process_packet(&mut TestHandler, &open_reply(id, true)).await.unwrap();
+        let mut data = vec![msg::CHANNEL_DATA];
+        id.encode(&mut data).unwrap();
+        b"unread".as_slice().encode(&mut data).unwrap();
+        session.process_packet(&mut TestHandler, &data).await.unwrap();
+        assert!(session.pending_channel_data.is_some());
+        drop(receiver);
+        drop(handoff);
+        let cleanup = session.priority_receiver.try_recv().unwrap();
+        session.dispatch_msg(cleanup).unwrap();
+        assert!(session.pending_channel_data.is_none());
+        assert!(session.channels.is_empty());
+        assert!(session.common.encrypted.as_ref().unwrap().channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn callback_only_open_confirmation_keeps_the_channel_live() {
+        struct CallbackOnly { confirmed: bool, received: Vec<u8> }
+        impl Handler for CallbackOnly {
+            type Error = Error;
+            async fn channel_open_confirmation(
+                &mut self, _: ChannelId, _: u32, _: u32, _: &mut Session,
+            ) -> Result<(), Error> {
+                self.confirmed = true;
+                Ok(())
+            }
+            async fn data(&mut self, _: ChannelId, data: &[u8], _: &mut Session) -> Result<(), Error> {
+                self.received.extend_from_slice(data);
+                Ok(())
+            }
+        }
+        let mut session = authenticated_session();
+        let id = session.channel_open_forwarded_tcpip("localhost", 80, "localhost", 1234).unwrap();
+        assert!(session.channels.is_empty());
+        session.common.encrypted.as_mut().unwrap().write.clear();
+        let mut handler = CallbackOnly { confirmed: false, received: Vec::new() };
+        session.process_packet(&mut handler, &open_reply(id, true)).await.unwrap();
+        assert!(handler.confirmed);
+        let mut data = vec![msg::CHANNEL_DATA];
+        id.encode(&mut data).unwrap();
+        b"payload".as_slice().encode(&mut data).unwrap();
+        session.process_packet(&mut handler, &data).await.unwrap();
+        assert_eq!(handler.received, b"payload");
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels[&id].confirmed);
+        assert!(enc.write.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refusal_of_a_dropped_channel_receiver_keeps_the_transport_alive() {
+        let mut session = authenticated_session();
+        let (id, channel) = close_test_channel(&mut session, false);
+        drop(channel);
+        session.process_packet(&mut TestHandler, &open_reply(id, false)).await.unwrap();
+        assert!(session.channels.is_empty());
+        assert!(session.common.encrypted.as_ref().unwrap().channels.is_empty());
+        assert!(!session.common.disconnected);
     }
 
     fn manual_window_channel(session: &mut Session) -> (ChannelId, ReceiveCredit) {
