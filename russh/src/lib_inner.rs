@@ -509,6 +509,10 @@ pub(crate) struct ReceiveCreditState {
     released: std::sync::atomic::AtomicBool,
     queued: std::sync::atomic::AtomicBool,
     dirty: tokio::sync::mpsc::UnboundedSender<ReceiveWindowEvent>,
+    defer_close: std::sync::atomic::AtomicBool,
+    close_sent: std::sync::atomic::AtomicBool,
+    close_received: std::sync::atomic::AtomicBool,
+    closed: tokio::sync::watch::Sender<Option<bool>>,
 }
 
 impl ReceiveCreditState {
@@ -523,6 +527,10 @@ impl ReceiveCreditState {
             released: false.into(),
             queued: false.into(),
             dirty,
+            defer_close: false.into(),
+            close_sent: false.into(),
+            close_received: false.into(),
+            closed: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -553,6 +561,38 @@ impl ReceiveCreditState {
 
     pub(crate) fn take_pending(&self) -> u32 {
         self.consumed.swap(0, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn defers_close(&self) -> bool {
+        self.defer_close.load(std::sync::atomic::Ordering::Acquire) && !self.is_released()
+    }
+
+    pub(crate) fn sent_close(&self) -> bool {
+        self.close_sent.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn received_close(&self) -> bool {
+        self.close_received.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn set_close_sent(&self) {
+        self.close_sent
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn set_close_received(&self) {
+        self.close_received
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn finish_close(&self, complete: bool) {
+        self.closed.send_if_modified(|closed| {
+            if closed.is_some() {
+                return false;
+            }
+            *closed = Some(complete);
+            true
+        });
     }
 }
 
@@ -590,6 +630,39 @@ impl ReceiveCredit {
             |pending| Some(pending.saturating_add(bytes)),
         );
         self.state.mark_dirty();
+    }
+
+    /// Let the application drain received data before replying to a peer close.
+    ///
+    /// Call before exchanging data. After draining, send [`Channel::close`] and
+    /// await [`Self::wait_closed`] before disconnecting the transport. Dropping
+    /// every credit handle releases the retained close state without waiting.
+    pub fn defer_close(&self) {
+        self.state
+            .defer_close
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Wait for both channel-close messages, or fail if the transport ends.
+    ///
+    /// Requires [`Self::defer_close`]. Do not await from a session callback.
+    pub async fn wait_closed(&self) -> Result<(), Error> {
+        if !self
+            .state
+            .defer_close
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Inconsistent);
+        }
+        let mut closed = self.state.closed.subscribe();
+        loop {
+            match *closed.borrow_and_update() {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(Error::Disconnect),
+                None => {}
+            }
+            closed.changed().await.map_err(|_| Error::Disconnect)?;
+        }
     }
 }
 
@@ -641,7 +714,21 @@ pub(crate) struct ChannelParams {
     pending_close: bool,
 }
 
+impl Drop for ChannelParams {
+    fn drop(&mut self) {
+        if let Some(state) = &self.application_consumed {
+            state.finish_close(false);
+        }
+    }
+}
+
 impl ChannelParams {
+    fn is_closing(&self) -> bool {
+        self.application_consumed
+            .as_ref()
+            .is_some_and(|state| state.sent_close() || state.received_close())
+    }
+
     pub fn confirm(&mut self, c: &ChannelOpenConfirmation) {
         self.recipient_channel = c.sender_channel; // "sender" is the sender of the confirmation
         self.recipient_window_size = c.initial_window_size;

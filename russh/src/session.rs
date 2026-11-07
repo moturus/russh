@@ -274,6 +274,9 @@ impl<C> CommonSession<C> {
 impl Encrypted {
     pub fn byte(&mut self, channel: ChannelId, msg: u8) -> Result<(), crate::Error> {
         if let Some(channel) = self.channels.get(&channel) {
+            if channel.is_closing() && msg != msg::CHANNEL_CLOSE {
+                return Ok(());
+            }
             push_packet!(self.write, {
                 self.write.push(msg);
                 channel.recipient_channel.encode(&mut self.write)?;
@@ -292,10 +295,32 @@ impl Encrypted {
     }
 
     pub fn close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .and_then(|params| params.application_consumed.as_ref())
+            .is_some_and(|state| state.sent_close())
+        {
+            return Ok(());
+        }
         if let Some(channel) = self.has_pending_data_mut(channel) {
             channel.pending_close = true;
         } else {
             self.byte(channel, msg::CHANNEL_CLOSE)?;
+            if let Some(state) = self
+                .channels
+                .get(&channel)
+                .and_then(|params| params.application_consumed.as_ref())
+                .filter(|state| state.defers_close())
+            {
+                state.set_close_sent();
+                // Retain only protocol parameters until the peer replies.
+                // Session::close has already released the inbound queue.
+                if !state.received_close() {
+                    return Ok(());
+                }
+                state.finish_close(true);
+            }
             self.channels.remove(&channel);
         }
         Ok(())
@@ -303,7 +328,32 @@ impl Encrypted {
 
     /// A peer close ends sending even when its receive window never reopens.
     pub fn close_from_peer(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        if let Some(params) = self.channels.get_mut(&channel)
+            && let Some(state) = params
+                .application_consumed
+                .as_ref()
+                .filter(|state| state.defers_close())
+        {
+            params.pending_data.clear();
+            params.pending_eof = false;
+            params.pending_close = false;
+            state.set_close_received();
+            // The application replies after draining its downstream socket.
+            if !state.sent_close() {
+                return Ok(());
+            }
+            state.finish_close(true);
+            self.channels.remove(&channel);
+            return Ok(());
+        }
         self.byte(channel, msg::CHANNEL_CLOSE)?;
+        if let Some(state) = self
+            .channels
+            .get(&channel)
+            .and_then(|params| params.application_consumed.as_ref())
+        {
+            state.finish_close(true);
+        }
         self.channels.remove(&channel);
         Ok(())
     }
@@ -330,6 +380,9 @@ impl Encrypted {
         let Some(channel) = self.channels.get_mut(&channel) else {
             return ReceiveWindowState::Discarded;
         };
+        if channel.is_closing() {
+            return ReceiveWindowState::Discarded;
+        }
         let len = u32::try_from(len).unwrap_or(u32::MAX);
 
         if len > channel.sender_maximum_packet_size {
@@ -409,6 +462,19 @@ impl Encrypted {
         channel: ChannelId,
         target: u32,
     ) -> Result<bool, crate::Error> {
+        let Some(params) = self.channels.get(&channel) else {
+            return Ok(false);
+        };
+        if let Some(state) = &params.application_consumed
+            && state.is_released()
+            && (state.sent_close() || state.received_close())
+        {
+            if !state.sent_close() {
+                self.byte(channel, msg::CHANNEL_CLOSE)?;
+            }
+            self.channels.remove(&channel);
+            return Ok(false);
+        }
         let Some(channel) = self.channels.get_mut(&channel) else {
             return Ok(false);
         };
@@ -417,6 +483,7 @@ impl Encrypted {
         };
         state.clear_dirty();
         if state.is_released() {
+            state.finish_close(false);
             state.take_pending();
             channel.application_consumed = None;
             // No message may precede this channel's own confirmation. An
@@ -426,6 +493,9 @@ impl Encrypted {
                 return Ok(false);
             }
             return Self::refill_channel(&mut self.write, channel, target);
+        }
+        if channel.is_closing() {
+            return Ok(false);
         }
         if !channel.confirmed || channel.pending_close || state.pending() == 0 {
             return Ok(false);
@@ -718,6 +788,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.is_closing() {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
@@ -742,6 +815,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.is_closing() {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, None, 0));
@@ -771,6 +847,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.is_closing() {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
@@ -794,6 +873,9 @@ impl Encrypted {
     ) -> Result<(), crate::Error> {
         let buf0 = buf0.into();
         if let Some(channel) = self.channels.get_mut(&channel) {
+            if channel.is_closing() {
+                return Ok(());
+            }
             assert!(channel.confirmed);
             if !channel.pending_data.is_empty() || is_rekeying {
                 channel.pending_data.push_back((buf0, Some(ext), 0));
@@ -1074,6 +1156,95 @@ mod tests {
         let mut channel = test_channel(sender_channel, recipient_channel, false, false);
         channel.pending_data.clear();
         channel
+    }
+
+    fn deferred_channel(encrypted: &mut Encrypted, id: ChannelId) -> crate::ReceiveCredit {
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut params = test_ready_channel(id, 42);
+        let credit = crate::ReceiveCredit::new(params.application_receive_credit(events));
+        credit.defer_close();
+        encrypted.channels.insert(id, params);
+        credit
+    }
+
+    #[tokio::test]
+    async fn deferred_close_waits_for_both_messages_in_either_order() {
+        for peer_first in [false, true] {
+            let id = ChannelId(10);
+            let mut encrypted = test_encrypted();
+            let credit = deferred_channel(&mut encrypted, id);
+            if peer_first {
+                encrypted.close_from_peer(id).unwrap();
+                assert!(encrypted.write.is_empty());
+            } else {
+                encrypted.close(id).unwrap();
+                encrypted.close(id).unwrap();
+                assert_eq!(packet_types(&encrypted.write), [msg::CHANNEL_CLOSE]);
+            }
+            assert!(encrypted.channels.contains_key(&id));
+            assert!(futures::poll!(Box::pin(credit.wait_closed())).is_pending());
+            encrypted.data(id, Bytes::from_static(b"late"), false).unwrap();
+            encrypted
+                .extended_data(id, 1, Bytes::from_static(b"late"), false)
+                .unwrap();
+            assert!(encrypted.channels[&id].pending_data.is_empty());
+            assert_eq!(
+                encrypted.consume_receive_window(id, 1, false),
+                ReceiveWindowState::Discarded
+            );
+            if peer_first {
+                encrypted.close(id).unwrap();
+            } else {
+                encrypted.close_from_peer(id).unwrap();
+            }
+            credit.wait_closed().await.unwrap();
+            assert!(!encrypted.channels.contains_key(&id));
+            assert_eq!(packet_types(&encrypted.write), [msg::CHANNEL_CLOSE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_close_discards_starved_output_and_releases_cancelled_waits() {
+        for peer_first in [false, true] {
+            let id = ChannelId(10);
+            let mut encrypted = test_encrypted();
+            let credit = deferred_channel(&mut encrypted, id);
+            let state = std::sync::Arc::downgrade(&credit.state);
+            if peer_first {
+                let params = encrypted.channels.get_mut(&id).unwrap();
+                params.recipient_window_size = 0;
+                params
+                    .pending_data
+                    .push_back((Bytes::from_static(b"blocked"), None, 0));
+                params.pending_close = true;
+                encrypted.close_from_peer(id).unwrap();
+                assert!(!encrypted.has_any_pending_data());
+            } else {
+                encrypted.close(id).unwrap();
+            }
+            let clone = credit.clone();
+            drop(credit);
+            encrypted.flush_receive_credit(id, 1024).unwrap();
+            assert!(encrypted.channels.contains_key(&id));
+            drop(clone);
+            encrypted.flush_receive_credit(id, 1024).unwrap();
+            assert!(!encrypted.channels.contains_key(&id));
+            assert!(state.upgrade().is_none());
+            assert_eq!(packet_types(&encrypted.write), [msg::CHANNEL_CLOSE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_loss_ends_a_deferred_close_wait() {
+        let mut encrypted = test_encrypted();
+        let credit = deferred_channel(&mut encrypted, ChannelId(10));
+        encrypted.close(ChannelId(10)).unwrap();
+        assert!(futures::poll!(Box::pin(credit.wait_closed())).is_pending());
+        drop(encrypted);
+        assert!(matches!(
+            credit.wait_closed().await,
+            Err(crate::Error::Disconnect)
+        ));
     }
 
     fn test_channel_windowed(
