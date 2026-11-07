@@ -397,6 +397,8 @@ pub(crate) struct PacketWriter {
     compress: Compress,
     packet_buffer: Vec<u8>,
     write_buffer: SSHBuffer,
+    write_offset: usize,
+    needs_flush: bool,
 }
 
 impl Debug for PacketWriter {
@@ -420,6 +422,8 @@ impl PacketWriter {
             compress,
             packet_buffer: Vec::new(),
             write_buffer: SSHBuffer::new(),
+            write_offset: 0,
+            needs_flush: false,
         }
     }
 
@@ -442,6 +446,7 @@ impl PacketWriter {
         &mut self,
         f: F,
     ) -> Result<(), Error> {
+        self.compact_written();
         self.write_payload_into_output(|buffer, payload_start| {
             f(buffer)?;
             Ok(buffer.len() - payload_start)
@@ -505,6 +510,7 @@ impl PacketWriter {
     }
 
     pub fn packet_raw(&mut self, buf: &[u8]) -> Result<(), Error> {
+        self.compact_written();
         if let Some(message_type) = buf.first() {
             debug!("> msg type {message_type:?}, len {}", buf.len());
             if matches!(&self.compress, Compress::None) {
@@ -583,6 +589,7 @@ impl PacketWriter {
     }
 
     pub fn buffer(&mut self) -> &mut SSHBuffer {
+        self.compact_written();
         &mut self.write_buffer
     }
 
@@ -607,12 +614,107 @@ impl PacketWriter {
         self.write_buffer.seqn = Wrapping(0);
     }
 
+    pub fn has_pending(&self) -> bool {
+        self.needs_flush || self.pending_bytes() != 0
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.write_buffer.buffer.len() - self.write_offset
+    }
+
+    fn compact_written(&mut self) {
+        // Amortize compaction while reads append replies during a partial write.
+        if self.write_offset > 0 && self.write_offset >= self.write_buffer.buffer.len() / 2 {
+            self.write_buffer.buffer.drain(..self.write_offset);
+            self.write_offset = 0;
+        }
+    }
+
+    /// Cancellation retains each completed write, including a pending flush.
     pub async fn flush_into<W: AsyncWrite + Unpin>(&mut self, w: &mut W) -> std::io::Result<()> {
-        if !self.write_buffer.buffer.is_empty() {
-            w.write_all(&self.write_buffer.buffer).await?;
+        if !self.has_pending() {
+            return Ok(());
+        }
+        while self.write_offset < self.write_buffer.buffer.len() {
+            let pending = self.write_buffer.buffer.get(self.write_offset..)
+                .ok_or(std::io::ErrorKind::InvalidData)?;
+            let written = w.write(pending).await?;
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            self.write_offset += written;
+            self.needs_flush = true;
+        }
+        if self.needs_flush {
             w.flush().await?;
+            self.needs_flush = false;
             self.write_buffer.buffer.clear();
+            self.write_offset = 0;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod partial_write_tests {
+    use super::*;
+    use futures::FutureExt;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn cancelled_flush_resumes_without_repeating_encrypted_bytes() {
+        let mut writer = PacketWriter::clear();
+        writer.packet_raw(&[2; 128]).unwrap();
+        let mut expected = writer.write_buffer.buffer.clone();
+        let (mut socket, mut peer) = tokio::io::duplex(128);
+        assert!(writer.flush_into(&mut socket).now_or_never().is_none());
+        assert_eq!(writer.pending_bytes(), expected.len() - 128);
+        let mut received = vec![0; 128];
+        peer.read_exact(&mut received).await.unwrap();
+        let before_append = writer.pending_bytes();
+        writer.packet_raw(&[3; 128]).unwrap();
+        let additional = writer.pending_bytes() - before_append;
+        expected.extend_from_slice(&writer.write_buffer.buffer[writer.write_buffer.buffer.len() - additional..]);
+        let remaining = expected.len() - received.len();
+        let mut rest = vec![0; remaining];
+        let (written, read) = tokio::join!(writer.flush_into(&mut socket), peer.read_exact(&mut rest));
+        written.unwrap();
+        read.unwrap();
+        received.extend(rest);
+        assert_eq!(received, expected);
+        assert!(!writer.has_pending());
+    }
+
+    #[tokio::test]
+    async fn appending_during_cancelled_underlying_flush_keeps_packet_order() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        #[derive(Default)]
+        struct Sink { bytes: Vec<u8>, ready: bool }
+        impl AsyncWrite for Sink {
+            fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+                self.bytes.extend_from_slice(data);
+                Poll::Ready(Ok(data.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                if self.ready { Poll::Ready(Ok(())) } else { Poll::Pending }
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                self.poll_flush(cx)
+            }
+        }
+        let mut writer = PacketWriter::clear();
+        writer.packet_raw(&[2; 128]).unwrap();
+        let mut expected = writer.write_buffer.buffer.clone();
+        let mut sink = Sink::default();
+        assert!(writer.flush_into(&mut sink).now_or_never().is_none());
+        assert_eq!(writer.pending_bytes(), 0);
+        assert!(writer.has_pending());
+        writer.packet_raw(&[3; 128]).unwrap();
+        expected.extend_from_slice(&writer.write_buffer.buffer);
+        sink.ready = true;
+        writer.flush_into(&mut sink).await.unwrap();
+        assert_eq!(sink.bytes, expected);
+        assert!(!writer.has_pending());
     }
 }
