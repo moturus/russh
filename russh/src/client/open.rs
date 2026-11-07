@@ -3,55 +3,6 @@ use tokio::sync::{mpsc, oneshot};
 use super::{ChannelRef, Handle, Handler, Msg, Session};
 use crate::{Channel, ChannelId, Error, ReceiveCredit};
 
-/// Internal ownership transfer for an application-controlled outgoing open.
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct PendingChannelCredit {
-    credit: ReceiveCredit,
-    cleanup: OpenCleanup,
-}
-
-impl PendingChannelCredit {
-    pub(super) fn new(
-        id: ChannelId,
-        sender: mpsc::UnboundedSender<Msg>,
-        credit: ReceiveCredit,
-    ) -> Self {
-        Self {
-            credit,
-            cleanup: OpenCleanup {
-                id,
-                sender: Some(sender),
-            },
-        }
-    }
-
-    fn finish(self) -> ReceiveCredit {
-        self.cleanup.disarm();
-        self.credit
-    }
-}
-
-#[derive(Debug)]
-struct OpenCleanup {
-    id: ChannelId,
-    sender: Option<mpsc::UnboundedSender<Msg>>,
-}
-
-impl OpenCleanup {
-    fn disarm(mut self) {
-        self.sender = None;
-    }
-}
-
-impl Drop for OpenCleanup {
-    fn drop(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(Msg::AbandonChannelOpen { id: self.id });
-        }
-    }
-}
-
 impl<H: Handler> Handle<H> {
     /// Open a forwarding channel with receive credit controlled by the caller.
     ///

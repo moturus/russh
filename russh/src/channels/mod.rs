@@ -9,6 +9,9 @@ use crate::{ChannelId, ChannelOpenFailure, Error, Pty, Sig};
 
 pub mod io;
 
+mod open;
+pub use open::PendingChannelCredit;
+
 mod channel_ref;
 pub use channel_ref::ChannelRef;
 

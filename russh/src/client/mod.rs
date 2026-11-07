@@ -81,7 +81,7 @@ mod pending;
 mod session;
 
 #[doc(hidden)]
-pub use open::PendingChannelCredit;
+pub type PendingChannelCredit = crate::channels::PendingChannelCredit<Msg>;
 
 #[cfg(test)]
 mod test;
@@ -1738,6 +1738,7 @@ impl Session {
                 self.channels.insert(id, channel_ref);
                 drop(credit.send(PendingChannelCredit::new(
                     id, self.priority_sender.clone(), receive_credit,
+                    |id| Msg::AbandonChannelOpen { id },
                 )));
             }
             Msg::AbandonChannelOpen { id } => self.abandon_channel_open(id)?,
