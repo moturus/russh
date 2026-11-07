@@ -222,3 +222,57 @@ async fn client_reads_channel_control_while_transport_write_is_blocked() {
 async fn server_reads_channel_control_while_transport_write_is_blocked() {
     eof_while_writing(false).await;
 }
+
+#[tokio::test]
+async fn peer_requests_cannot_grow_blocked_transport_output_without_bound() {
+    timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(None).await;
+        fixture.server_gate.blocked.store(true, Ordering::Release);
+        let requests = async {
+            loop {
+                if fixture.client.send_keepalive(true).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let stopped = async { (&mut fixture.server).await.unwrap() };
+        tokio::pin!(requests, stopped);
+        tokio::select! {
+            result = &mut stopped => assert!(matches!(result, Err(russh::Error::Pending))),
+            () = &mut requests => assert!(matches!(stopped.await, Err(russh::Error::Pending))),
+        }
+    })
+    .await
+    .expect("blocked response queue did not reach its bound");
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_transport_write_preserves_inactivity_timeout() {
+    let mut fixture = Fixture::new(Some(Duration::from_secs(1))).await;
+    let (_client, channel) = fixture.channel().await;
+    fixture.server_gate.blocked.store(true, Ordering::Release);
+    channel.data(&[1; 1024][..]).await.unwrap();
+    fixture.server_gate.entered.notified().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let result = timeout(Duration::from_secs(5), &mut fixture.server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(russh::Error::InactivityTimeout)));
+}
+
+#[tokio::test]
+async fn read_eof_cancels_a_blocked_transport_write() {
+    timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(None).await;
+        let (_client, channel) = fixture.channel().await;
+        fixture.server_gate.blocked.store(true, Ordering::Release);
+        channel.data(&[1; 1024][..]).await.unwrap();
+        fixture.server_gate.entered.notified().await;
+        fixture.server_gate.eof.store(true, Ordering::Release);
+        fixture.server_gate.reader.wake();
+        assert!((&mut fixture.server).await.unwrap().is_err());
+    })
+    .await
+    .expect("transport read EOF did not release the blocked writer");
+}

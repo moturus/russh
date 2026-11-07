@@ -133,7 +133,7 @@ pageant = { version = "0.2", path = "../pageant" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 russh-sftp = "2.3.0"
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream.workspace = true
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
