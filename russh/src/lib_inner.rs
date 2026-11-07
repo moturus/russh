@@ -753,6 +753,32 @@ impl ChannelParams {
     }
 }
 
+/// Bound replies added to a blocked transport batch, separately from its
+/// already admitted application output. Progress restores that allowance.
+pub(crate) struct TransportBackpressure {
+    growth: usize,
+    limit: usize,
+}
+
+impl TransportBackpressure {
+    pub(crate) fn new(window: u32, packet: u32) -> Self {
+        Self {
+            growth: 0,
+            limit: (window as usize).saturating_add(packet as usize).saturating_mul(2),
+        }
+    }
+
+    pub(crate) fn update(&mut self, before: usize, after: usize) -> Result<(), Error> {
+        self.growth = if before == 0 {
+            0
+        } else {
+            self.growth.saturating_add(after.saturating_sub(before))
+                .saturating_sub(before.saturating_sub(after))
+        };
+        if self.growth > self.limit { Err(Error::Pending) } else { Ok(()) }
+    }
+}
+
 pub(crate) async fn flush_or_timeout<W: AsyncWrite + Unpin>(
     writer: &mut sshbuffer::PacketWriter,
     stream: &mut W,

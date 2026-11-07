@@ -1422,8 +1422,6 @@ impl Session {
         let mut result: Result<RemoteDisconnectInfo, H::Error> = Err(Error::Disconnect.into());
         self.flush()?;
 
-        map_err!(self.common.packet_writer.flush_into(stream_write).await)?;
-
         let buffer = SSHBuffer::new();
 
         // Allow handing out references to the cipher
@@ -1440,6 +1438,9 @@ impl Session {
 
         let reading = start_reading(stream_read, buffer, opening_cipher);
         pin!(reading);
+        let mut backpressure = crate::TransportBackpressure::new(
+            self.common.config.window_size, self.common.config.maximum_packet_size,
+        );
 
         #[allow(clippy::panic)] // false positive in select! macro
         while !self.common.disconnected {
@@ -1450,12 +1451,17 @@ impl Session {
             // Keep reading the network for window adjustments, but leave
             // application output in its bounded receivers while a channel is
             // window-blocked.
-            let can_receive_outbound = !self.kex.active() && !self.common.has_any_pending_data();
+            let writing = self.common.packet_writer.has_pending();
+            let before_write = self.common.packet_writer.pending_bytes();
+            let can_receive_outbound = !writing && !self.kex.active() && !self.common.has_any_pending_data();
             let has_pending_channel_packet = self.pending_channel_packet.is_some();
             let rekey_timer =
                 crate::future_or_pending(self.rekey_time_remaining(), tokio::time::sleep);
             pin!(rekey_timer);
             tokio::select! {
+                r = self.common.packet_writer.flush_into(stream_write), if writing => {
+                    map_err!(r)?;
+                }
                 r = &mut reading, if !has_pending_channel_packet => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
@@ -1575,12 +1581,7 @@ impl Session {
             };
 
             self.flush()?;
-            crate::flush_or_timeout(
-                &mut self.common.packet_writer,
-                stream_write,
-                inactivity_timer.as_mut(),
-            )
-            .await?;
+            backpressure.update(before_write, self.common.packet_writer.pending_bytes())?;
 
             if let Some(ref mut enc) = self.common.encrypted
                 && let EncryptedState::InitCompression = enc.state
@@ -1618,6 +1619,9 @@ impl Session {
             }
         }
 
+        crate::flush_or_timeout(
+            &mut self.common.packet_writer, stream_write, inactivity_timer.as_mut(),
+        ).await?;
         result
     }
 

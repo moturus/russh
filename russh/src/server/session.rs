@@ -841,7 +841,7 @@ impl Session {
 
     pub(crate) async fn run<H, R>(
         mut self,
-        mut stream: SshRead<R>,
+        stream: SshRead<R>,
         mut handler: H,
     ) -> Result<(), H::Error>
     where
@@ -849,8 +849,6 @@ impl Session {
         R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         self.flush()?;
-
-        map_err!(self.common.packet_writer.flush_into(&mut stream).await)?;
 
         let (stream_read, mut stream_write) = stream.split();
         let buffer = SSHBuffer::new();
@@ -870,6 +868,9 @@ impl Session {
         let reading = start_reading(stream_read, buffer, opening_cipher);
         pin!(reading);
         let mut is_reading = None;
+        let mut backpressure = crate::TransportBackpressure::new(
+            self.common.config.window_size, self.common.config.maximum_packet_size,
+        );
 
         #[allow(clippy::panic)] // false positive in macro
         while !self.common.disconnected {
@@ -888,7 +889,7 @@ impl Session {
             // Leave application messages in the bounded receiver once a peer's
             // channel window is exhausted. Network reads remain active so a
             // window adjustment can release the queued data.
-            if !self.kex.active() && !self.common.has_any_pending_data() {
+            if !self.common.packet_writer.has_pending() && !self.kex.active() && !self.common.has_any_pending_data() {
                 let mut drained = 0;
                 while drained < MAX_MESSAGES_PER_BATCH {
                     // Only Empty/Disconnected end the drain; both mean "nothing
@@ -908,12 +909,6 @@ impl Session {
                 }
                 if drained > 0 {
                     self.flush()?;
-                    crate::flush_or_timeout(
-                        &mut self.common.packet_writer,
-                        &mut stream_write,
-                        inactivity_timer.as_mut(),
-                    )
-                    .await?;
                 }
                 // A drained Disconnect sets this; don't block in `select!` after.
                 if self.common.disconnected {
@@ -925,7 +920,12 @@ impl Session {
             pin!(rekey_timer);
 
             let has_pending_channel_data = self.pending_channel_data.is_some();
+            let writing = self.common.packet_writer.has_pending();
+            let before_write = self.common.packet_writer.pending_bytes();
             tokio::select! {
+                r = self.common.packet_writer.flush_into(&mut stream_write), if writing => {
+                    map_err!(r)?;
+                }
                 r = &mut reading, if !has_pending_channel_data => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
                         Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
@@ -999,7 +999,7 @@ impl Session {
                         }
                     }
                 }
-                msg = self.receiver.recv(), if !self.kex.active() && !self.common.has_any_pending_data() => {
+                msg = self.receiver.recv(), if !writing && !self.kex.active() && !self.common.has_any_pending_data() => {
                     // Channel open replies must be dispatched before any
                     // channel traffic queued after them: `msg` may be data for
                     // a channel whose confirmation is still sitting in the
@@ -1038,12 +1038,7 @@ impl Session {
             }
             self.flush()?;
 
-            crate::flush_or_timeout(
-                &mut self.common.packet_writer,
-                &mut stream_write,
-                inactivity_timer.as_mut(),
-            )
-            .await?;
+            backpressure.update(before_write, self.common.packet_writer.pending_bytes())?;
 
             if self.common.received_data {
                 // Reset the number of failed keepalive attempts. We don't
@@ -1071,6 +1066,11 @@ impl Session {
             }
         }
         debug!("disconnected");
+        if self.common.disconnected {
+            crate::flush_or_timeout(
+                &mut self.common.packet_writer, &mut stream_write, inactivity_timer.as_mut(),
+            ).await?;
+        }
         // Shutdown
         map_err!(stream_write.shutdown().await)?;
         loop {
