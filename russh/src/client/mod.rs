@@ -2646,6 +2646,47 @@ mod tests {
     }
 
     #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn callback_only_session_open_preserves_confirmation_and_data() {
+        struct CallbackOnly {
+            confirmed: bool,
+            received: Vec<u8>,
+        }
+        impl Handler for CallbackOnly {
+            type Error = Error;
+            async fn channel_open_confirmation(
+                &mut self, _: ChannelId, _: u32, _: u32, _: &mut Session,
+            ) -> Result<(), Self::Error> {
+                self.confirmed = true;
+                Ok(())
+            }
+            async fn data(&mut self, _: ChannelId, data: &[u8], _: &mut Session) -> Result<(), Self::Error> {
+                self.received.extend_from_slice(data);
+                Ok(())
+            }
+        }
+        let mut session = authenticated_session();
+        let id = session.channel_open_session().unwrap();
+        assert!(!session.channels.contains_key(&id));
+        session.common.encrypted.as_mut().unwrap().write.clear();
+        let mut confirmation = vec![msg::CHANNEL_OPEN_CONFIRMATION];
+        for value in [u32::from(id), 42, 1024, 128] {
+            value.encode(&mut confirmation).unwrap();
+        }
+        let mut handler = CallbackOnly { confirmed: false, received: Vec::new() };
+        session.process_packet(&mut handler, &confirmation).await.unwrap();
+        assert!(handler.confirmed, "valid callback-only open was treated as cancelled");
+        let mut data = vec![msg::CHANNEL_DATA];
+        id.encode(&mut data).unwrap();
+        b"payload".as_slice().encode(&mut data).unwrap();
+        session.process_packet(&mut handler, &data).await.unwrap();
+        assert_eq!(handler.received, b"payload");
+        let enc = session.common.encrypted.as_ref().unwrap();
+        assert!(enc.channels.contains_key(&id));
+        assert!(enc.write.is_empty(), "callback-only channel was closed");
+    }
+
+    #[cfg(feature = "flate2")]
     fn manual_open_message() -> (Msg, Receiver<ChannelMsg>, oneshot::Receiver<PendingChannelCredit>) {
         let (sender, receiver) = channel(1);
         let (credit, handoff) = oneshot::channel();

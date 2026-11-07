@@ -2058,6 +2058,7 @@ impl Session {
             // Inserted before the handler runs so it can select receive-window
             // policy, but not established until its acceptance is finalized.
             confirmed: false,
+            open_abandoned: false,
             wants_reply: false,
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,

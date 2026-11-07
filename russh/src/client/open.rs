@@ -62,6 +62,7 @@ impl Session {
         } else {
             // As in OpenSSH, keep the outstanding channel ID for its reply.
             // There is no application receiver, payload, or credit handoff left.
+            parameters.open_abandoned = true;
             parameters.application_consumed = None;
             Ok(())
         }

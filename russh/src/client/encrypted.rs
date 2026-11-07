@@ -515,9 +515,10 @@ impl Session {
                 map_err!(ensure_end(&reader))?;
                 let local_id = ChannelId(msg.recipient_channel);
 
-                if let Some(ref mut enc) = self.common.encrypted {
+                let abandoned = if let Some(ref mut enc) = self.common.encrypted {
                     if let Some(parameters) = enc.channels.get_mut(&local_id) {
                         parameters.confirm(&msg);
+                        parameters.open_abandoned
                     } else {
                         // We've not requested this channel, close connection.
                         return Err(crate::Error::Inconsistent.into());
@@ -528,7 +529,7 @@ impl Session {
 
                 // Cancellation keeps an opening protocol record for this reply,
                 // but never exposes the late success to the application.
-                if !self.channels.get(&local_id).is_some_and(|channel| !channel.is_closed()) {
+                if abandoned || self.channels.get(&local_id).is_some_and(|channel| channel.is_closed()) {
                     self.close(local_id)?;
                     return Ok(());
                 }
@@ -840,6 +841,7 @@ impl Session {
                     sender_window_exceeded: 0,
                     application_consumed: None,
                     confirmed: false,
+                    open_abandoned: false,
                     wants_reply: false,
                     pending_data: std::collections::VecDeque::new(),
                     pending_eof: false,

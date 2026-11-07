@@ -631,6 +631,8 @@ pub(crate) struct ChannelParams {
     application_consumed: Option<std::sync::Arc<ReceiveCreditState>>,
     /// Has the other side confirmed the channel?
     pub confirmed: bool,
+    /// An outstanding open abandoned by its application future.
+    open_abandoned: bool,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     wants_reply: bool,
     /// (buffer, extended stream #, data offset in buffer)
