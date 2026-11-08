@@ -108,6 +108,7 @@ pub struct Session {
     receive_credit_sender: UnboundedSender<ReceiveWindowEvent>,
     receive_credit_receiver: UnboundedReceiver<ReceiveWindowEvent>,
     pending_channel_packet: Option<pending::PendingChannelPacket>,
+    received_disconnect: bool,
     open_global_requests: VecDeque<GlobalRequestResponse>,
     server_sig_algs: Option<Vec<Algorithm>>,
     /// Number of EXT_INFO messages received (RFC 8308 allows at most two).
@@ -1353,6 +1354,7 @@ impl Session {
             receive_credit_sender,
             receive_credit_receiver,
             pending_channel_packet: None,
+            received_disconnect: false,
             channels: HashMap::new(),
             pending_reads: Vec::new(),
             pending_len: 0,
@@ -1383,7 +1385,9 @@ impl Session {
         self.receiver.close();
         self.priority_receiver.close();
         self.inbound_channel_receiver.close();
-        map_err!(stream_write.shutdown().await)?;
+        if !self.received_disconnect {
+            map_err!(stream_write.shutdown().await)?;
+        }
         match result {
             Ok(v) => {
                 handler
@@ -1619,9 +1623,11 @@ impl Session {
             }
         }
 
-        crate::flush_or_timeout(
-            &mut self.common.packet_writer, stream_write, inactivity_timer.as_mut(),
-        ).await?;
+        if !self.received_disconnect {
+            crate::flush_or_timeout(
+                &mut self.common.packet_writer, stream_write, inactivity_timer.as_mut(),
+            ).await?;
+        }
         result
     }
 
@@ -1629,6 +1635,8 @@ impl Session {
         &mut self,
         pkt: &IncomingSshPacket,
     ) -> Result<RemoteDisconnectInfo, Error> {
+        // SSH termination must not wait for further transport progress.
+        self.received_disconnect = true;
         let mut r = &pkt.buffer[..];
         u8::decode(&mut r)?; // skip message type
         self.common.disconnected = true;

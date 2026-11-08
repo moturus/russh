@@ -27,6 +27,10 @@ impl Waiter {
 struct Gate {
     blocked: AtomicBool,
     eof: AtomicBool,
+    shutdown_blocked: AtomicBool,
+    withhold_eof: AtomicBool,
+    transport_dropped: AtomicBool,
+    held: Mutex<Option<DuplexStream>>,
     entered: Notify,
     reader: Waiter,
     writer: Waiter,
@@ -39,8 +43,16 @@ impl Gate {
 }
 
 struct Wire {
-    inner: DuplexStream,
+    inner: Option<DuplexStream>,
     gate: Arc<Gate>,
+}
+impl Drop for Wire {
+    fn drop(&mut self) {
+        if self.gate.withhold_eof.load(Ordering::Acquire) {
+            *self.gate.held.lock().unwrap() = self.inner.take();
+        }
+        self.gate.transport_dropped.store(true, Ordering::Release);
+    }
 }
 impl AsyncRead for Wire {
     fn poll_read(
@@ -52,7 +64,7 @@ impl AsyncRead for Wire {
         if self.gate.eof.load(Ordering::Acquire) {
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(self.inner.as_mut().unwrap()).poll_read(cx, buf)
     }
 }
 impl AsyncWrite for Wire {
@@ -66,17 +78,31 @@ impl AsyncWrite for Wire {
             self.gate.entered.notify_one();
             return Poll::Pending;
         }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        Pin::new(self.inner.as_mut().unwrap()).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        Pin::new(self.inner.as_mut().unwrap()).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        if self.gate.shutdown_blocked.load(Ordering::Acquire) {
+            return Poll::Pending;
+        }
+        if self.gate.withhold_eof.load(Ordering::Acquire) {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(self.inner.as_mut().unwrap()).poll_shutdown(cx)
     }
 }
 
-struct Client;
+struct Client {
+    dropped: Arc<AtomicBool>,
+    reasons: mpsc::UnboundedSender<client::RemoteDisconnectInfo>,
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
 impl client::Handler for Client {
     type Error = russh::Error;
     async fn check_server_key(
@@ -84,6 +110,19 @@ impl client::Handler for Client {
         _: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                self.reasons.send(info).unwrap();
+                Ok(())
+            }
+            client::DisconnectReason::Error(error) => Err(error),
+        }
     }
 }
 struct Server(mpsc::UnboundedSender<Channel<server::Msg>>);
@@ -107,7 +146,10 @@ impl server::Handler for Server {
 struct Fixture {
     client: client::Handle<Client>,
     server: tokio::task::JoinHandle<Result<(), russh::Error>>,
+    server_handle: server::Handle,
     incoming: mpsc::UnboundedReceiver<Channel<server::Msg>>,
+    client_handler_dropped: Arc<AtomicBool>,
+    reasons: mpsc::UnboundedReceiver<client::RemoteDisconnectInfo>,
     client_gate: Arc<Gate>,
     server_gate: Arc<Gate>,
 }
@@ -133,30 +175,36 @@ impl Fixture {
         });
         let (opened, incoming) = mpsc::unbounded_channel();
         let server_stream = Wire {
-            inner: server_wire,
+            inner: Some(server_wire),
             gate: server_gate.clone(),
         };
-        let server = tokio::spawn(async move {
-            server::run_stream(config, server_stream, Server(opened))
-                .await
-                .unwrap()
-                .await
-        });
+        let starting = tokio::spawn(server::run_stream(config, server_stream, Server(opened)));
+        let client_handler_dropped = Arc::new(AtomicBool::new(false));
+        let (reasons_tx, reasons) = mpsc::unbounded_channel();
         let mut client = client::connect_stream(
             Arc::new(client::Config::default()),
             Wire {
-                inner: client_wire,
+                inner: Some(client_wire),
                 gate: client_gate.clone(),
             },
-            Client,
+            Client {
+                dropped: client_handler_dropped.clone(),
+                reasons: reasons_tx,
+            },
         )
         .await
         .unwrap();
+        let running = starting.await.unwrap().unwrap();
+        let server_handle = running.handle();
+        let server = tokio::spawn(running);
         assert!(client.authenticate_none("user").await.unwrap().success());
         Self {
             client,
             server,
+            server_handle,
             incoming,
+            client_handler_dropped,
+            reasons,
             client_gate,
             server_gate,
         }
@@ -170,6 +218,63 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+#[tokio::test]
+async fn client_received_disconnect_releases_transport_and_handler_without_peer_eof() {
+    timeout(Duration::from_secs(5), async {
+        for blocked in [true, false] {
+            let mut fixture = Fixture::new(None).await;
+            let (channel, _remote) = fixture.channel().await;
+            fixture
+                .server_gate
+                .withhold_eof
+                .store(true, Ordering::Release);
+            fixture
+                .client_gate
+                .shutdown_blocked
+                .store(true, Ordering::Release);
+            if blocked {
+                fixture.client_gate.blocked.store(true, Ordering::Release);
+                channel.data(&[1; 1024][..]).await.unwrap();
+                fixture.client_gate.entered.notified().await;
+            }
+            fixture
+                .server_handle
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "finished".into(),
+                    "en".into(),
+                )
+                .await
+                .unwrap();
+            (&mut fixture.client).await.unwrap();
+            assert!(
+                fixture
+                    .client_gate
+                    .transport_dropped
+                    .load(Ordering::Acquire)
+            );
+            assert!(fixture.client_handler_dropped.load(Ordering::Acquire));
+            let reason = fixture.reasons.recv().await.unwrap();
+            assert!(matches!(
+                reason.reason_code,
+                russh::Disconnect::ByApplication
+            ));
+            assert_eq!(reason.message, "finished");
+            assert_eq!(reason.lang_tag, "en");
+            assert!(fixture.server_gate.withhold_eof.load(Ordering::Acquire));
+            assert!(
+                !fixture
+                    .server_gate
+                    .transport_dropped
+                    .load(Ordering::Acquire)
+                    || fixture.server_gate.held.lock().unwrap().is_some()
+            );
+        }
+    })
+    .await
+    .expect("received disconnect retained the client session");
 }
 
 async fn eof_while_writing(block_client: bool) {
