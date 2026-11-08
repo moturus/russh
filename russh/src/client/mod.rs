@@ -1739,6 +1739,7 @@ impl Session {
                     &host_to_connect, port_to_connect, &originator_address, originator_port,
                 )?;
                 let receive_credit = self.receive_credit(id).ok_or(Error::Inconsistent)?;
+                receive_credit.defer_close();
                 self.channels.insert(id, channel_ref);
                 drop(credit.send(PendingChannelCredit::new(
                     id, self.priority_sender.clone(), receive_credit,

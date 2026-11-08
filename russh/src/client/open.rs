@@ -10,6 +10,8 @@ impl<H: Handler> Handle<H> {
     /// not polled again after confirmation. Cancellation releases application
     /// state immediately; a pending protocol record lasts until the peer replies
     /// or disconnects, and a late success is closed.
+    /// Peer close acknowledgement is deferred from dispatch until the caller
+    /// drains and closes the channel, or drops the last receive-credit handle.
     pub async fn channel_open_direct_tcpip_with_credit<A: Into<String>, B: Into<String>>(
         &self,
         host_to_connect: A,

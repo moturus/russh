@@ -10,6 +10,7 @@ const WINDOW: u32 = 8192;
 enum Event {
     Confirmed,
     Keys,
+    Closed,
 }
 
 struct Client(mpsc::UnboundedSender<Event>);
@@ -35,6 +36,15 @@ impl client::Handler for Client {
         Ok(())
     }
 
+    async fn channel_close(
+        &mut self,
+        _: ChannelId,
+        _: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.0.send(Event::Closed).unwrap();
+        Ok(())
+    }
+
     async fn kex_done(
         &mut self,
         _: Option<&[u8]>,
@@ -48,7 +58,10 @@ impl client::Handler for Client {
 
 type Opened = (Channel<server::Msg>, server::ChannelOpenHandle);
 
-struct Server(mpsc::UnboundedSender<Opened>);
+struct Server(
+    mpsc::UnboundedSender<Opened>,
+    mpsc::UnboundedSender<russh::ReceiveCredit>,
+);
 
 impl server::Handler for Server {
     type Error = russh::Error;
@@ -65,12 +78,15 @@ impl server::Handler for Server {
         origin: &str,
         origin_port: u32,
         reply: server::ChannelOpenHandle,
-        _: &mut server::Session,
+        session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         assert_eq!(
             (host, port, origin, origin_port),
             ("target", 1234, "origin", 5678)
         );
+        let credit = session.receive_credit(channel.id()).unwrap();
+        credit.defer_close();
+        self.1.send(credit).unwrap();
         self.0.send((channel, reply)).unwrap();
         Ok(())
     }
@@ -81,12 +97,14 @@ struct Pair {
     server: server::RunningSession<Server>,
     opened: mpsc::UnboundedReceiver<Opened>,
     events: mpsc::UnboundedReceiver<Event>,
+    credits: mpsc::UnboundedReceiver<russh::ReceiveCredit>,
 }
 
 impl Pair {
     async fn connect() -> Self {
         let (socket, peer) = tokio::io::duplex(64 * 1024);
         let (opened_tx, opened) = mpsc::unbounded_channel();
+        let (credits_tx, credits) = mpsc::unbounded_channel();
         let starting = tokio::spawn(server::run_stream(
             Arc::new(server::Config {
                 keys: vec![
@@ -100,7 +118,7 @@ impl Pair {
                 ..Default::default()
             }),
             socket,
-            Server(opened_tx),
+            Server(opened_tx, credits_tx),
         ));
         let (events_tx, mut events) = mpsc::unbounded_channel();
         let mut client = client::connect_stream(
@@ -124,6 +142,7 @@ impl Pair {
             server,
             opened,
             events,
+            credits,
         }
     }
 
@@ -155,6 +174,53 @@ async fn read_window(channel: &mut Channel<client::Msg>) {
         }
     }
     assert_eq!(bytes, WINDOW);
+}
+
+#[tokio::test]
+async fn outgoing_credit_defers_peer_close_while_opener_is_unpolled() {
+    timeout(Duration::from_secs(5), async {
+        for discard in [false, true] {
+            let mut pair = Pair::connect().await;
+            let mut opening = Box::pin(
+                pair.client
+                    .channel_open_direct_tcpip_with_credit("target", 1234, "origin", 5678),
+            );
+            let (remote, reply) = tokio::select! {
+                opened = pair.opened.recv() => opened.unwrap(),
+                result = opening.as_mut() => panic!("open completed before reply: {result:?}"),
+            };
+            reply.accept().await;
+            assert!(matches!(pair.events.recv().await, Some(Event::Confirmed)));
+            let remote_credit = pair.credits.recv().await.unwrap();
+            remote.data_bytes(vec![9; WINDOW as usize]).await.unwrap();
+            remote.eof().await.unwrap();
+            remote.close().await.unwrap();
+            assert!(matches!(pair.events.recv().await, Some(Event::Closed)));
+            pair.client.send_ping().await.unwrap();
+            assert!(futures::poll!(Box::pin(remote_credit.wait_closed())).is_pending());
+
+            let (mut channel, credit) = opening.await.unwrap();
+            if discard {
+                let last = credit.clone();
+                drop(credit);
+                pair.client.send_ping().await.unwrap();
+                assert!(futures::poll!(Box::pin(remote_credit.wait_closed())).is_pending());
+                drop(last);
+            } else {
+                read_window(&mut channel).await;
+                credit.consumed(WINDOW);
+                assert!(matches!(channel.wait().await, Some(ChannelMsg::Eof)));
+                assert!(matches!(channel.wait().await, Some(ChannelMsg::Close)));
+                channel.close().await.unwrap();
+                credit.wait_closed().await.unwrap();
+            }
+            remote_credit.wait_closed().await.unwrap();
+            // The peer may terminate the connection once the drain is acknowledged.
+            pair.finish().await;
+        }
+    })
+    .await
+    .expect("outgoing close acknowledgement stalled");
 }
 
 #[tokio::test]

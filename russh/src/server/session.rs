@@ -421,6 +421,8 @@ impl Handle {
     /// not polled again after confirmation. Cancellation releases application
     /// state immediately; a pending protocol record lasts until the peer replies
     /// or disconnects, and a late success is closed.
+    /// Peer close acknowledgement is deferred from dispatch until the caller
+    /// drains and closes the channel, or drops the last receive-credit handle.
     pub async fn channel_open_forwarded_tcpip_with_credit<A: Into<String>, B: Into<String>>(
         &self,
         connected_address: A,
@@ -693,6 +695,7 @@ impl Session {
                     originator_port,
                 )?;
                 let receive_credit = self.receive_credit(id).ok_or(Error::Inconsistent)?;
+                receive_credit.defer_close();
                 self.channels.insert(id, channel_ref);
                 let handoff = PendingChannelCredit::new(
                     id,
