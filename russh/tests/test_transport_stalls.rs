@@ -277,6 +277,59 @@ async fn client_received_disconnect_releases_transport_and_handler_without_peer_
     .expect("received disconnect retained the client session");
 }
 
+async fn server_received_disconnect(blocked: bool) {
+    timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(None).await;
+        let (_remote, channel) = fixture.channel().await;
+        fixture
+            .client_gate
+            .withhold_eof
+            .store(true, Ordering::Release);
+        if blocked {
+            fixture.server_gate.blocked.store(true, Ordering::Release);
+            fixture
+                .server_gate
+                .shutdown_blocked
+                .store(true, Ordering::Release);
+            channel.data(&[1; 1024][..]).await.unwrap();
+            fixture.server_gate.entered.notified().await;
+        }
+        fixture
+            .client
+            .disconnect(russh::Disconnect::ByApplication, "finished", "")
+            .await
+            .unwrap();
+        assert!(matches!(
+            (&mut fixture.client).await,
+            Err(russh::Error::Disconnect)
+        ));
+        // Retain the peer's transport after its SSH task exits: no read EOF is
+        // available to the server, even when all its writes can complete.
+        assert!(fixture.client_gate.held.lock().unwrap().is_some());
+        (&mut fixture.server).await.unwrap().unwrap();
+        assert!(
+            fixture
+                .server_gate
+                .transport_dropped
+                .load(Ordering::Acquire)
+        );
+        assert!(fixture.incoming.is_closed(), "server handler retained");
+        assert!(fixture.client_gate.held.lock().unwrap().is_some());
+    })
+    .await
+    .expect("received disconnect retained the server session");
+}
+
+#[tokio::test]
+async fn server_received_disconnect_releases_a_blocked_writer_without_peer_eof() {
+    server_received_disconnect(true).await;
+}
+
+#[tokio::test]
+async fn server_received_disconnect_finishes_without_waiting_for_peer_eof() {
+    server_received_disconnect(false).await;
+}
+
 async fn eof_while_writing(block_client: bool) {
     timeout(Duration::from_secs(5), async {
         let mut fixture = Fixture::new(None).await;

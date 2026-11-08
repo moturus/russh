@@ -944,9 +944,10 @@ impl Session {
                     match pkt.buffer.first() {
                         None => (),
                         Some(&crate::msg::DISCONNECT) => {
-                            debug!("break");
-                            is_reading = Some((stream_read, buffer, opening_cipher));
-                            break;
+                            // The peer ended SSH; do not wait for transport EOF
+                            // or further write progress before releasing ownership.
+                            debug!("received disconnect");
+                            return Ok(());
                         }
                         Some(_) => {
                             self.common.received_data = true;
